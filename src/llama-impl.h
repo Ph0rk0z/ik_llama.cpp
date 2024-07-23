@@ -35,7 +35,7 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 //
 // helpers
 //
-
+/*
 static void replace_all(std::string & s, const std::string & search, const std::string & replace) {
     if (search.empty()) {
         return;
@@ -52,3 +52,4 @@ static void replace_all(std::string & s, const std::string & search, const std::
     builder.append(s, last_pos, std::string::npos);
     s = std::move(builder);
 }
+*/
