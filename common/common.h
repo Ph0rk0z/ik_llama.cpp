@@ -61,6 +61,15 @@ struct llama_control_vector_load_info;
 // CPU utils
 //
 
+struct cpu_params {
+    int      n_threads                   = -1;
+    bool     cpumask[512] = {false}; // CPU affinity mask.
+    bool     mask_valid                  = false;   // Default: any CPU
+//    enum ggml_sched_priority  priority   = GGML_SCHED_PRIO_NORMAL;  // Scheduling prio : (0 - normal, 1 - medium, 2 - high, 3 - realtime)
+    bool     strict_cpu                  = false;   // Use strict CPU placement
+    uint32_t poll                        = 50;      // Polling (busywait) level (0 - no polling, 100 - mostly polling)
+};
+
 int32_t cpu_get_num_physical_cores();
 int32_t cpu_get_num_math();
 
@@ -75,12 +84,13 @@ enum dimre_method {
 };
 
 struct gpt_params {
-    uint32_t seed                 = LLAMA_DEFAULT_SEED; // RNG seed
+//    uint32_t seed                 = LLAMA_DEFAULT_SEED; // RNG seed
 
     int32_t n_threads             = cpu_get_num_math();
     int32_t n_threads_draft       =    -1;
     int32_t n_threads_batch       =    -1; // number of threads to use for batch processing (-1 = use n_threads)
     int32_t n_threads_batch_draft =    -1;
+
     int32_t n_predict             =    -1; // new tokens to predict
     int32_t n_ctx                 =     0; // context size
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
@@ -107,6 +117,11 @@ struct gpt_params {
     int32_t yarn_orig_ctx         =     0; // YaRN original context length
     float   defrag_thold          = -1.0f; // KV cache defragmentation threshold
 
+    struct cpu_params cpuparams;
+    struct cpu_params cpuparams_batch;
+    struct cpu_params draft_cpuparams;
+    struct cpu_params draft_cpuparams_batch;
+
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
 
@@ -117,8 +132,7 @@ struct gpt_params {
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
 
-    // // sampling parameters
-    struct llama_sampling_params sparams;
+    struct gpt_sampler_params sparams;
 
     std::string model                = ""; // model path
     std::string model_draft          = ""; // draft model for speculative decoding
@@ -190,7 +204,6 @@ struct gpt_params {
     float thresh_experts   = 0;
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
-    bool ignore_eos        = false; // ignore generated EOS tokens
     bool logits_all        = false; // return logits for all tokens in the batch
     bool use_mmap          = true;  // use mmap for faster loads
     bool use_mlock         = false; // use mlock to keep model in memory

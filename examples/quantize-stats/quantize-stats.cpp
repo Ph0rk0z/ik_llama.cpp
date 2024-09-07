@@ -9,6 +9,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "llama.h"
+#include "llama-impl.h"
 
 #define GGML_COMMON_DECL_C
 #define GGML_COMMON_IMPL_C
@@ -1057,8 +1058,7 @@ int main(int argc, char ** argv) {
         }
 
         auto cparams = llama_context_default_params();
-        cparams.n_ctx      = 256;
-        cparams.seed       = 1;
+        cparams.n_ctx = 256;
 
         ctx = llama_new_context_with_model(model, cparams);
 
