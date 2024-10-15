@@ -13,6 +13,7 @@ enum gpt_sampler_type {
     GPT_SAMPLER_TYPE_TFS_Z       = 4,
     GPT_SAMPLER_TYPE_TYPICAL_P   = 5,
     GPT_SAMPLER_TYPE_TEMPERATURE = 6,
+    GPT_SAMPLER_TYPE_XTC         = 7,
 };
 
 // sampling parameters
@@ -25,6 +26,8 @@ struct gpt_sampler_params {
     int32_t top_k             = 40;    // <= 0 to use vocab size
     float   top_p             = 0.95f; // 1.0 = disabled
     float   min_p             = 0.05f; // 0.0 = disabled
+    float   xtc_probability   = 0.00f; // 0.0 = disabled
+    float   xtc_threshold     = 0.10f; // > 0.5 disables XTC
     float   tfs_z             = 1.00f; // 1.0 = disabled
     float   typ_p             = 1.00f; // typical_p, 1.0 = disabled
     float   temp              = 0.80f; // <= 0.0 to sample greedily, 0.0 to not output probabilities
@@ -46,7 +49,9 @@ struct gpt_sampler_params {
         GPT_SAMPLER_TYPE_TYPICAL_P,
         GPT_SAMPLER_TYPE_TOP_P,
         GPT_SAMPLER_TYPE_MIN_P,
+        GPT_SAMPLER_TYPE_XTC,
         GPT_SAMPLER_TYPE_TEMPERATURE
+
     };
 
     std::string grammar; // optional BNF-like grammar to constrain sampling
@@ -56,6 +61,7 @@ struct gpt_sampler_params {
     // print the parameters into a string
     std::string print() const;
 };
+
 
 // gpt_sampler extends llama_sampler with additional functionality:
 //

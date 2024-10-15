@@ -77,20 +77,75 @@ int32_t cpu_get_num_math();
 // CLI argument parsing
 //
 
+enum common_sampler_type {
+    COMMON_SAMPLER_TYPE_NONE        = 0,
+    COMMON_SAMPLER_TYPE_TOP_K       = 1,
+    COMMON_SAMPLER_TYPE_TOP_P       = 2,
+    COMMON_SAMPLER_TYPE_MIN_P       = 3,
+    COMMON_SAMPLER_TYPE_TFS_Z       = 4,
+    COMMON_SAMPLER_TYPE_TYPICAL_P   = 5,
+    COMMON_SAMPLER_TYPE_TEMPERATURE = 6,
+    COMMON_SAMPLER_TYPE_XTC         = 7,
+
+};
+
 // dimensionality reduction methods, used by cvector-generator
 enum dimre_method {
     DIMRE_METHOD_PCA,
     DIMRE_METHOD_MEAN,
 };
 
-struct gpt_params {
-//    uint32_t seed                 = LLAMA_DEFAULT_SEED; // RNG seed
+// sampler parameters
+struct common_sampler_params {
+    uint32_t seed                 = LLAMA_DEFAULT_SEED; // RNG seed
+    int32_t n_prev            = 64;    // number of previous tokens to remember
+    int32_t n_probs           = 0;     // if greater than 0, output the probabilities of top n_probs tokens.
+    int32_t min_keep          = 0;     // 0 = disabled, otherwise samplers should return at least min_keep tokens
+    int32_t top_k             = 40;    // <= 0 to use vocab size
+    float   top_p             = 0.95f; // 1.0 = disabled
+    float   min_p             = 0.05f; // 0.0 = disabled
+    float   xtc_probability   = 0.00f; // 0.0 = disabled
+    float   xtc_threshold     = 0.10f; // > 0.5 disables XTC
+    float   tfs_z             = 1.00f; // 1.0 = disabled
+    float   typ_p             = 1.00f; // typical_p, 1.0 = disabled
+    float   temp              = 0.80f; // <= 0.0 to sample greedily, 0.0 to not output probabilities
+    float   dynatemp_range    = 0.00f; // 0.0 = disabled
+    float   dynatemp_exponent = 1.00f; // controls how entropy maps to temperature in dynamic temperature sampler
+    int32_t penalty_last_n    = 64;    // last n tokens to penalize (0 = disable penalty, -1 = context size)
+    float   penalty_repeat    = 1.00f; // 1.0 = disabled
+    float   penalty_freq      = 0.00f; // 0.0 = disabled
+    float   penalty_present   = 0.00f; // 0.0 = disabled
+    int32_t mirostat          = 0;     // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
+    float   mirostat_tau      = 5.00f; // target entropy
+    float   mirostat_eta      = 0.10f; // learning rate
+    bool    penalize_nl       = false; // consider newlines as a repeatable token
+    bool    ignore_eos        = false;
+    //bool    no_perf           = false; // disable performance metrics
 
+
+    std::vector<enum common_sampler_type> samplers = {
+        COMMON_SAMPLER_TYPE_TOP_K,
+        COMMON_SAMPLER_TYPE_TFS_Z,
+        COMMON_SAMPLER_TYPE_TYPICAL_P,
+        COMMON_SAMPLER_TYPE_TOP_P,
+        COMMON_SAMPLER_TYPE_MIN_P,
+        COMMON_SAMPLER_TYPE_XTC,
+        COMMON_SAMPLER_TYPE_TEMPERATURE
+    };
+
+    std::string grammar; // optional BNF-like grammar to constrain sampling
+
+    std::vector<llama_logit_bias> logit_bias; // logit biases to apply
+
+    // print the parameters into a string
+    std::string print() const;
+};
+
+struct gpt_params {
     int32_t n_threads             = cpu_get_num_math();
     int32_t n_threads_draft       =    -1;
     int32_t n_threads_batch       =    -1; // number of threads to use for batch processing (-1 = use n_threads)
     int32_t n_threads_batch_draft =    -1;
-
     int32_t n_predict             =    -1; // new tokens to predict
     int32_t n_ctx                 =     0; // context size
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
@@ -133,6 +188,8 @@ struct gpt_params {
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
 
     struct gpt_sampler_params sparams;
+
+   //struct common_sampler_params sparams;
 
     std::string model                = ""; // model path
     std::string model_draft          = ""; // draft model for speculative decoding
