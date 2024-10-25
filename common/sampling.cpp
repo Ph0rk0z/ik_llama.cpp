@@ -127,9 +127,11 @@ std::string gpt_sampler_params::print() const {
 
     snprintf(result, sizeof(result),
             "\trepeat_last_n = %d, repeat_penalty = %.3f, frequency_penalty = %.3f, presence_penalty = %.3f\n"
+            "\tdry_multiplier = %.3f, dry_base = %.3f, dry_allowed_length = %d, dry_penalty_last_n = %d\n"
             "\ttop_k = %d, tfs_z = %.3f, top_p = %.3f, min_p = %.3f, xtc_probability = %.3f, xtc_threshold = %.3f, typical_p = %.3f, temp = %.3f\n"
             "\tmirostat = %d, mirostat_lr = %.3f, mirostat_ent = %.3f",
             penalty_last_n, penalty_repeat, penalty_freq, penalty_present,
+            dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n,
             top_k, tfs_z, top_p, min_p, xtc_probability, xtc_threshold, typ_p, temp,
             mirostat, mirostat_eta, mirostat_tau);
 
@@ -172,6 +174,17 @@ struct gpt_sampler * gpt_sampler_init(const struct llama_model * model, const st
     if (params.mirostat == 0) {
         for (const auto & cnstr : params.samplers) {
             switch (cnstr) {
+                    case GPT_SAMPLER_TYPE_DRY:
+                    {
+                        std::vector<const char*> c_breakers;
+                        c_breakers.reserve(params.dry_sequence_breakers.size());
+                        for (const auto& str : params.dry_sequence_breakers) {
+                            c_breakers.push_back(str.c_str());
+                        }
+
+                        llama_sampler_chain_add(result->chain, llama_sampler_init_dry      (model, params.dry_multiplier, params.dry_base, params.dry_allowed_length, params.dry_penalty_last_n, c_breakers.data(), c_breakers.size()));
+                    }
+                        break;
                 case GPT_SAMPLER_TYPE_TOP_K:
                     llama_sampler_chain_add(result->chain, llama_sampler_init_top_k    (params.top_k));
                     break;
@@ -356,6 +369,7 @@ std::string gpt_sampler_prev_str(gpt_sampler * gsmpl, llama_context * ctx_main, 
 
 char gpt_sampler_type_to_chr(enum gpt_sampler_type cnstr) {
     switch (cnstr) {
+        case GPT_SAMPLER_TYPE_DRY:         return 'd';
         case GPT_SAMPLER_TYPE_TOP_K:       return 'k';
         case GPT_SAMPLER_TYPE_TFS_Z:       return 'f';
         case GPT_SAMPLER_TYPE_TYPICAL_P:   return 'y';
@@ -363,12 +377,14 @@ char gpt_sampler_type_to_chr(enum gpt_sampler_type cnstr) {
         case GPT_SAMPLER_TYPE_MIN_P:       return 'm';
         case GPT_SAMPLER_TYPE_TEMPERATURE: return 't';
         case GPT_SAMPLER_TYPE_XTC:         return 'x';
+        case GPT_SAMPLER_TYPE_INFILL:      return 'i';
         default : return '?';
     }
 }
 
 std::string gpt_sampler_type_to_str(enum gpt_sampler_type cnstr) {
     switch (cnstr) {
+        case GPT_SAMPLER_TYPE_DRY:         return "dry";
         case GPT_SAMPLER_TYPE_TOP_K:       return "top_k";
         case GPT_SAMPLER_TYPE_TFS_Z:       return "tfs_z";
         case GPT_SAMPLER_TYPE_TYPICAL_P:   return "typ_p";
@@ -376,12 +392,14 @@ std::string gpt_sampler_type_to_str(enum gpt_sampler_type cnstr) {
         case GPT_SAMPLER_TYPE_MIN_P:       return "min_p";
         case GPT_SAMPLER_TYPE_TEMPERATURE: return "temperature";
         case GPT_SAMPLER_TYPE_XTC:         return "xtc";
+        case GPT_SAMPLER_TYPE_INFILL:      return "infill";
         default : return "";
     }
 }
 
 std::vector<gpt_sampler_type> gpt_sampler_types_from_names(const std::vector<std::string> & names, bool allow_alt_names) {
     std::unordered_map<std::string, gpt_sampler_type> sampler_canonical_name_map {
+        { "dry",         GPT_SAMPLER_TYPE_DRY },
         { "top_k",       GPT_SAMPLER_TYPE_TOP_K },
         { "top_p",       GPT_SAMPLER_TYPE_TOP_P },
         { "typ_p",       GPT_SAMPLER_TYPE_TYPICAL_P },
@@ -389,6 +407,7 @@ std::vector<gpt_sampler_type> gpt_sampler_types_from_names(const std::vector<std
         { "tfs_z",       GPT_SAMPLER_TYPE_TFS_Z },
         { "temperature", GPT_SAMPLER_TYPE_TEMPERATURE },
         { "xtc",         GPT_SAMPLER_TYPE_XTC },
+        { "infill",      GPT_SAMPLER_TYPE_INFILL },
     };
 
     // since samplers names are written multiple ways
@@ -429,13 +448,15 @@ std::vector<gpt_sampler_type> gpt_sampler_types_from_names(const std::vector<std
 
 std::vector<gpt_sampler_type> gpt_sampler_types_from_chars(const std::string & chars) {
     std::unordered_map<char, gpt_sampler_type> sampler_name_map = {
+        { gpt_sampler_type_to_chr(GPT_SAMPLER_TYPE_DRY),         GPT_SAMPLER_TYPE_DRY },
         { gpt_sampler_type_to_chr(GPT_SAMPLER_TYPE_TOP_K),       GPT_SAMPLER_TYPE_TOP_K },
         { gpt_sampler_type_to_chr(GPT_SAMPLER_TYPE_TFS_Z),       GPT_SAMPLER_TYPE_TFS_Z },
         { gpt_sampler_type_to_chr(GPT_SAMPLER_TYPE_TYPICAL_P),   GPT_SAMPLER_TYPE_TYPICAL_P },
         { gpt_sampler_type_to_chr(GPT_SAMPLER_TYPE_TOP_P),       GPT_SAMPLER_TYPE_TOP_P },
         { gpt_sampler_type_to_chr(GPT_SAMPLER_TYPE_MIN_P),       GPT_SAMPLER_TYPE_MIN_P },
         { gpt_sampler_type_to_chr(GPT_SAMPLER_TYPE_TEMPERATURE), GPT_SAMPLER_TYPE_TEMPERATURE },
-        { gpt_sampler_type_to_chr(GPT_SAMPLER_TYPE_XTC),         GPT_SAMPLER_TYPE_XTC }
+        { gpt_sampler_type_to_chr(GPT_SAMPLER_TYPE_XTC),         GPT_SAMPLER_TYPE_XTC },
+        { gpt_sampler_type_to_chr(GPT_SAMPLER_TYPE_INFILL),      GPT_SAMPLER_TYPE_INFILL },
     };
 
     std::vector<gpt_sampler_type> samplers;

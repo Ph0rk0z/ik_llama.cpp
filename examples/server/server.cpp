@@ -907,32 +907,58 @@ struct server_context {
             slot.oaicompat_model = "";
         }
 
-        slot.params.stream             = json_value(data, "stream",            false);
-        slot.params.cache_prompt       = json_value(data, "cache_prompt",      true);
-        slot.params.n_predict          = json_value(data, "n_predict",         json_value(data, "max_tokens", default_params.n_predict));
-        slot.sparams.top_k             = json_value(data, "top_k",             default_sparams.top_k);
-        slot.sparams.top_p             = json_value(data, "top_p",             default_sparams.top_p);
-        slot.sparams.min_p             = json_value(data, "min_p",             default_sparams.min_p);
-        slot.sparams.xtc_probability   = json_value(data, "xtc_probability",   default_sparams.xtc_probability);
-        slot.sparams.xtc_threshold     = json_value(data, "xtc_threshold",     default_sparams.xtc_threshold);
-        slot.sparams.tfs_z             = json_value(data, "tfs_z",             default_sparams.tfs_z);
-        slot.sparams.typ_p             = json_value(data, "typical_p",         default_sparams.typ_p);
-        slot.sparams.temp              = json_value(data, "temperature",       default_sparams.temp);
-        slot.sparams.dynatemp_range    = json_value(data, "dynatemp_range",    default_sparams.dynatemp_range);
-        slot.sparams.dynatemp_exponent = json_value(data, "dynatemp_exponent", default_sparams.dynatemp_exponent);
-        slot.sparams.penalty_last_n    = json_value(data, "repeat_last_n",     default_sparams.penalty_last_n);
-        slot.sparams.penalty_repeat    = json_value(data, "repeat_penalty",    default_sparams.penalty_repeat);
-        slot.sparams.penalty_freq      = json_value(data, "frequency_penalty", default_sparams.penalty_freq);
-        slot.sparams.penalty_present   = json_value(data, "presence_penalty",  default_sparams.penalty_present);
-        slot.sparams.mirostat          = json_value(data, "mirostat",          default_sparams.mirostat);
-        slot.sparams.mirostat_tau      = json_value(data, "mirostat_tau",      default_sparams.mirostat_tau);
-        slot.sparams.mirostat_eta      = json_value(data, "mirostat_eta",      default_sparams.mirostat_eta);
-        slot.sparams.penalize_nl       = json_value(data, "penalize_nl",       default_sparams.penalize_nl);
-        slot.params.n_keep             = json_value(data, "n_keep",            slot.params.n_keep);
-        slot.params.n_discard          = json_value(data, "n_discard",         default_params.n_discard);
-        slot.sparams.seed              = json_value(data, "seed",              default_sparams.seed);
-        slot.sparams.n_probs           = json_value(data, "n_probs",           default_sparams.n_probs);
-        slot.sparams.min_keep          = json_value(data, "min_keep",          default_sparams.min_keep);
+        slot.params.stream              = json_value(data, "stream",             false);
+        slot.params.cache_prompt        = json_value(data, "cache_prompt",       false);
+        slot.params.n_predict           = json_value(data, "n_predict",          json_value(data, "max_tokens", default_params.n_predict));
+ //       slot.params.n_indent            = json_value(data, "n_indent",           default_params.n_indent);
+        slot.sparams.top_k              = json_value(data, "top_k",              default_sparams.top_k);
+        slot.sparams.top_p              = json_value(data, "top_p",              default_sparams.top_p);
+        slot.sparams.min_p              = json_value(data, "min_p",              default_sparams.min_p);
+        slot.sparams.xtc_probability    = json_value(data, "xtc_probability",    default_sparams.xtc_probability);
+        slot.sparams.xtc_threshold      = json_value(data, "xtc_threshold",      default_sparams.xtc_threshold);
+        slot.sparams.tfs_z              = json_value(data, "tfs_z",              default_sparams.tfs_z);
+        slot.sparams.typ_p              = json_value(data, "typical_p",          default_sparams.typ_p);
+        slot.sparams.temp               = json_value(data, "temperature",        default_sparams.temp);
+        slot.sparams.dynatemp_range     = json_value(data, "dynatemp_range",     default_sparams.dynatemp_range);
+        slot.sparams.dynatemp_exponent  = json_value(data, "dynatemp_exponent",  default_sparams.dynatemp_exponent);
+        slot.sparams.penalty_last_n     = json_value(data, "repeat_last_n",      default_sparams.penalty_last_n);
+        slot.sparams.penalty_repeat     = json_value(data, "repeat_penalty",     default_sparams.penalty_repeat);
+        slot.sparams.penalty_freq       = json_value(data, "frequency_penalty",  default_sparams.penalty_freq);
+        slot.sparams.penalty_present    = json_value(data, "presence_penalty",   default_sparams.penalty_present);
+        slot.sparams.dry_multiplier     = json_value(data, "dry_multiplier",     default_sparams.dry_multiplier);
+        slot.sparams.dry_base           = json_value(data, "dry_base",           default_sparams.dry_base);
+        slot.sparams.dry_allowed_length = json_value(data, "dry_allowed_length", default_sparams.dry_allowed_length);
+        slot.sparams.dry_penalty_last_n = json_value(data, "dry_penalty_last_n", default_sparams.dry_penalty_last_n);
+        slot.sparams.mirostat           = json_value(data, "mirostat",           default_sparams.mirostat);
+        slot.sparams.mirostat_tau       = json_value(data, "mirostat_tau",       default_sparams.mirostat_tau);
+        slot.sparams.mirostat_eta       = json_value(data, "mirostat_eta",       default_sparams.mirostat_eta);
+        slot.sparams.penalize_nl        = json_value(data, "penalize_nl",        default_sparams.penalize_nl);
+        slot.params.n_keep              = json_value(data, "n_keep",             default_params.n_keep);
+        slot.params.n_discard           = json_value(data, "n_discard",          default_params.n_discard);
+        slot.sparams.seed               = json_value(data, "seed",               default_sparams.seed);
+        slot.sparams.n_probs            = json_value(data, "n_probs",            default_sparams.n_probs);
+        slot.sparams.min_keep           = json_value(data, "min_keep",           default_sparams.min_keep);
+      //slot.params.t_max_prompt_ms     = json_value(data, "t_max_prompt_ms",    default_params.t_max_prompt_ms); // TODO: implement
+      //  slot.params.t_max_predict_ms    = json_value(data, "t_max_predict_ms",   default_params.t_max_predict_ms);
+
+        if (slot.sparams.dry_base < 1.0f)
+        {
+           slot.sparams.dry_base = default_sparams.dry_base;
+        }
+
+        // sequence breakers for DRY
+        {
+            // Currently, this is not compatible with TextGen WebUI, Koboldcpp and SillyTavern format
+            // Ref: https://github.com/oobabooga/text-generation-webui/blob/d1af7a41ade7bd3c3a463bfa640725edb818ebaf/extensions/openai/typing.py#L39
+
+            if (data.contains("dry_sequence_breakers")) {
+                slot.sparams.dry_sequence_breakers = json_value(data, "dry_sequence_breakers", std::vector<std::string>());
+                if (slot.sparams.dry_sequence_breakers.empty()) {
+                    send_error(task, "Error: dry_sequence_breakers must be a non-empty array of strings", ERROR_TYPE_INVALID_REQUEST);
+                    return false;
+                }
+            }
+        }
 
         // process "json_schema" and "grammar"
         if (data.contains("json_schema") && !data.at("json_schema").is_null() && data.contains("grammar") && !data.at("grammar").is_null()) {
@@ -1302,6 +1328,11 @@ struct server_context {
             {"repeat_penalty",            slot.sparams.penalty_repeat},
             {"presence_penalty",          slot.sparams.penalty_present},
             {"frequency_penalty",         slot.sparams.penalty_freq},
+            {"dry_multiplier",            slot.sparams.dry_multiplier},
+            {"dry_base",                  slot.sparams.dry_base},
+            {"dry_allowed_length",        slot.sparams.dry_allowed_length},
+            {"dry_penalty_last_n",        slot.sparams.dry_penalty_last_n},
+            {"dry_sequence_breakers",     slot.sparams.dry_sequence_breakers},
             {"mirostat",                  slot.sparams.mirostat},
             {"mirostat_tau",              slot.sparams.mirostat_tau},
             {"mirostat_eta",              slot.sparams.mirostat_eta},
@@ -2121,9 +2152,54 @@ struct server_context {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 slot.n_past = common_part(slot.cache_tokens, prompt_tokens);
 
+
                                 // push the prompt into the sampling context (do not apply grammar)
                                 for (int i = 0; i < slot.n_past; ++i) {
                                     gpt_sampler_accept(slot.smpl, slot.cache_tokens[i], false);
+/*
+                                // reuse chunks from the cached prompt by shifting their KV cache in the new position
+                                if (params.n_cache_reuse > 0) {
+                                    size_t head_c = slot.n_past; // cache
+                                    size_t head_p = slot.n_past; // current prompt
+
+                                    SLT_DBG(slot, "trying to reuse chunks with size > %d, slot.n_past = %d\n", params.n_cache_reuse, slot.n_past);
+
+                                    while (head_c < slot.cache_tokens.size() &&
+                                           head_p < prompt_tokens.size()) {
+
+                                        size_t n_match = 0;
+                                        while (head_c + n_match < slot.cache_tokens.size() &&
+                                               head_p + n_match < prompt_tokens.size()     &&
+                                               slot.cache_tokens[head_c + n_match] == prompt_tokens[head_p + n_match]) {
+
+                                            n_match++;
+                                        }
+
+                                        if (n_match >= (size_t) params.n_cache_reuse) {
+                                            SLT_INF(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
+                                            //for (size_t i = head_p; i < head_p + n_match; i++) {
+                                            //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx, prompt_tokens[i]).c_str());
+                                            //}
+
+                                            const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
+
+                                            llama_kv_cache_seq_rm (ctx, slot.id + 1, head_p, head_c);
+                                            llama_kv_cache_seq_add(ctx, slot.id + 1, head_c, -1,     kv_shift);
+
+                                            for (size_t i = 0; i < n_match; i++) {
+                                                slot.cache_tokens[head_p + i] = slot.cache_tokens[head_c + i];
+                                                slot.n_past++;
+                                            }
+
+                                            head_c += n_match;
+                                            head_p += n_match;
+                                        } else {
+                                            head_c += 1;
+                                        }
+                                    }
+
+                                    SLT_DBG(slot, "after context reuse, new slot.n_past = %d\n", slot.n_past);
+*/
                                 }
                             }
                         }
