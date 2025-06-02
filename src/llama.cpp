@@ -135,6 +135,7 @@ static std::string trim(const std::string & str) {
     return str.substr(start, end - start);
 }
 
+/*
 static void replace_all(std::string & s, const std::string & search, const std::string & replace) {
     std::string result;
     for (size_t pos = 0; ; pos += search.length()) {
@@ -151,7 +152,7 @@ static void replace_all(std::string & s, const std::string & search, const std::
     }
     return str.substr(start, end - start);
 }
-
+*/
 static bool is_float_close(float a, float b, float abs_tol) {
     // Check for non-negative tolerance
     if (abs_tol < 0.0) {
@@ -3174,6 +3175,8 @@ struct llama_context {
     struct llama_grammar        grammar;
     struct llama_kv_cache       kv_self;
     struct llama_control_vector cvec;
+
+    std::vector<float> scale_data;
 
     std::unordered_map<struct llama_lora_adapter *, float> lora_adapters;
 
@@ -21374,7 +21377,7 @@ struct llama_data_write {
 
     void write_rng(const std::mt19937 & rng) {
         std::ostringstream rng_ss;
-        rng_ss << ctx->sampling.rng;
+        rng_ss << rng;
 
         const std::string & rng_str = rng_ss.str();
 
@@ -21384,164 +21387,6 @@ struct llama_data_write {
     void write_output_ids(const struct llama_context * ctx) {
         const uint32_t n_outputs = ctx->n_outputs;
 
-        // copy output ids
-        {
-            std::vector<int32_t> output_pos;
-
-            const size_t    n_batch = ctx->cparams.n_batch;
-            const auto & output_ids = ctx->output_ids;
-
-            output_pos.resize(ctx->output_size);
-
-            // build a more compact representation of the output ids
-            for (size_t i = 0; i < n_batch; ++i) {
-                // map an output id to a position in the batch
-                int32_t pos = output_ids[i];
-                if (pos >= 0) {
-                    if ((size_t) pos >= n_outputs) {
-                        n_outputs = pos + 1;
-                    }
-                    GGML_ASSERT((size_t) pos < ctx->output_size);
-                    output_pos[pos] = i;
-                }
-            }
-
-            data_ctx->write(&n_outputs, sizeof(n_outputs));
-
-            if (n_outputs) {
-                data_ctx->write(output_pos.data(), n_outputs * sizeof(int32_t));
-            }
-        }
-
-        // copy logits
-        {
-            const size_t logits_size = std::min(ctx->logits_size, n_outputs * ctx->model.hparams.n_vocab);
-
-            data_ctx->write(&logits_size, sizeof(logits_size));
-
-            if (logits_size) {
-                data_ctx->write(ctx->logits, logits_size * sizeof(float));
-            }
-        }
-
-        // copy embeddings
-        {
-            const size_t embeddings_size = std::min(ctx->embd_size, n_outputs * ctx->model.hparams.n_embd);
-
-            data_ctx->write(&embeddings_size, sizeof(embeddings_size));
-
-            if (embeddings_size) {
-                data_ctx->write(ctx->embd, embeddings_size * sizeof(float));
-            }
-        }
-    }
-
-    // copy kv cache
-    {
-        const auto & kv_self = ctx->kv_self;
-        const auto & hparams = ctx->model.hparams;
-
-        const uint32_t n_layer      = hparams.n_layer;
-
-        // NOTE: kv_size and kv_buf_size are mostly used for sanity checks
-        const uint32_t kv_head     = llama_kv_cache_cell_max(kv_self);
-        const uint32_t kv_size     = kv_self.size;
-        const size_t   kv_buf_size = kv_self.total_size() / (kv_size ? kv_size : 1) * kv_head;
-        const uint32_t kv_used     = kv_self.used;
-        const uint32_t v_trans     = kv_self.v_trans ? 1 : 0;
-
-        data_ctx->write(&kv_buf_size, sizeof(kv_buf_size));
-        data_ctx->write(&kv_head,     sizeof(kv_head));
-        data_ctx->write(&kv_size,     sizeof(kv_size));
-        data_ctx->write(&kv_used,     sizeof(kv_used));
-        data_ctx->write(&v_trans,     sizeof(v_trans));
-
-        if (kv_buf_size) {
-            const size_t pre_kv_buf_size = data_ctx->get_size_written();
-
-            std::vector<uint8_t> tmp_buf;
-            for (int il = 0; il < (int) n_layer; ++il) {
-                const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s();
-                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
-
-                const size_t k_size = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa*kv_head);
-
-                tmp_buf.resize(k_size);
-                ggml_backend_tensor_get(kv_self.k_l[il], tmp_buf.data(), 0, tmp_buf.size());
-                data_ctx->write(tmp_buf.data(), tmp_buf.size());
-
-                if (kv_self.recurrent || !kv_self.v_trans) {
-                    // v is contiguous for recurrent models
-                    // TODO: use other tensors for state models than k and v
-                    const size_t v_size = ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa*kv_head);
-
-                    tmp_buf.resize(v_size);
-                    ggml_backend_tensor_get(kv_self.v_l[il], tmp_buf.data(), 0, tmp_buf.size());
-                    data_ctx->write(tmp_buf.data(), tmp_buf.size());
-                    continue;
-                }
-
-                // v is not contiguous, copy row by row
-                const size_t v_row_size   = ggml_row_size(kv_self.v_l[il]->type, kv_head);
-                const size_t v_row_stride = ggml_row_size(kv_self.v_l[il]->type, kv_size);
-
-                tmp_buf.resize(v_row_size);
-                for (int ir = 0; ir < (int) n_embd_v_gqa; ++ir) {
-                    ggml_backend_tensor_get(kv_self.v_l[il], tmp_buf.data(), ir*v_row_stride, tmp_buf.size());
-                    data_ctx->write(tmp_buf.data(), tmp_buf.size());
-                }
-            }
-            GGML_ASSERT(kv_buf_size == data_ctx->get_size_written() - pre_kv_buf_size);
-        }
-
-        for (uint32_t i = 0; i < kv_head; ++i) {
-            const auto & cell = kv_self.cells[i];
-
-            const llama_pos pos         = cell.pos;
-            const size_t    seq_id_size = cell.seq_id.size();
-
-            data_ctx->write(&pos,         sizeof(pos));
-            data_ctx->write(&seq_id_size, sizeof(seq_id_size));
-
-            for (auto seq_id : cell.seq_id) {
-                data_ctx->write(&seq_id, sizeof(seq_id));
-            }
-        }
-    }
-}
-
-size_t llama_state_get_data(struct llama_context * ctx, uint8_t * dst) {
-    llama_data_buffer_context data_ctx(dst);
-    llama_state_get_data_internal(ctx, &data_ctx);
-
-    return data_ctx.get_size_written();
-}
-
-// Sets the state reading from the specified source address
-size_t llama_state_set_data(struct llama_context * ctx, const uint8_t * src) {
-    llama_synchronize(ctx);
-
-    const uint8_t * inp = src;
-
-    // set rng
-    {
-        size_t rng_size;
-        memcpy(&rng_size, inp, sizeof(rng_size)); inp += sizeof(rng_size);
-
-        GGML_ASSERT(rng_size <= LLAMA_MAX_RNG_STATE);
-
-        std::string rng_str((const char *)inp, rng_size); inp += rng_size;
-
-        std::istringstream rng_ss(rng_str);
-        rng_ss >> ctx->sampling.rng;
-
-        GGML_ASSERT(!rng_ss.fail());
-    }
-
-    // set output ids
-    {
-        size_t n_outputs;
->>>>>>> 938943cd (llama : move vocab, grammar and sampling into separate files (#8508))
         std::vector<int32_t> output_pos;
 
         const size_t    n_batch = ctx->cparams.n_batch;
@@ -22792,6 +22637,112 @@ int32_t llama_detokenize(
 //
 // chat templates
 //
+
+
+static llm_chat_template llama_chat_detect_template(const std::string & tmpl) {
+    if (auto it = LLM_CHAT_TEMPLATES.find(tmpl); it != LLM_CHAT_TEMPLATES.end()) {
+        return it->second;
+    }
+    auto tmpl_contains = [&tmpl](const char * haystack) -> bool {
+        return tmpl.find(haystack) != std::string::npos;
+    };
+    if (tmpl_contains("<|im_start|>")) {
+        return LLM_CHAT_TEMPLATE_CHATML;
+    } else if (tmpl.find("mistral") == 0 || tmpl_contains("[INST]")) {
+        if (tmpl_contains("[SYSTEM_PROMPT]")) {
+            return LLM_CHAT_TEMPLATE_MISTRAL_V7;
+        } else if (
+            // catches official 'v1' template
+            tmpl_contains("' [INST] ' + system_message")
+            // catches official 'v3' and 'v3-tekken' templates
+            || tmpl_contains("[AVAILABLE_TOOLS]")
+        ) {
+            // Official mistral 'v1', 'v3' and 'v3-tekken' templates
+            // See: https://github.com/mistralai/cookbook/blob/main/concept-deep-dive/tokenization/chat_templates.md
+            // See: https://github.com/mistralai/cookbook/blob/main/concept-deep-dive/tokenization/templates.md
+            if (tmpl_contains(" [INST]")) {
+                return LLM_CHAT_TEMPLATE_MISTRAL_V1;
+            } else if (tmpl_contains("\"[INST]\"")) {
+                return LLM_CHAT_TEMPLATE_MISTRAL_V3_TEKKEN;
+            }
+            return LLM_CHAT_TEMPLATE_MISTRAL_V3;
+        } else {
+            // llama2 template and its variants
+            // [variant] support system message
+            // See: https://huggingface.co/blog/llama2#how-to-prompt-llama-2
+            bool support_system_message = tmpl_contains("<<SYS>>");
+            bool add_bos_inside_history = tmpl_contains("bos_token + '[INST]");
+            bool strip_message = tmpl_contains("content.strip()");
+            if (strip_message) {
+                return LLM_CHAT_TEMPLATE_LLAMA_2_SYS_STRIP;
+            } else if (add_bos_inside_history) {
+                return LLM_CHAT_TEMPLATE_LLAMA_2_SYS_BOS;
+            } else if (support_system_message) {
+                return LLM_CHAT_TEMPLATE_LLAMA_2_SYS;
+            } else {
+                return LLM_CHAT_TEMPLATE_LLAMA_2;
+            }
+        }
+    } else if (tmpl_contains("<|assistant|>") && tmpl_contains("<|end|>")) {
+        return LLM_CHAT_TEMPLATE_PHI_3;
+    } else if (tmpl_contains("<|assistant|>") && tmpl_contains("<|user|>")) {
+        return LLM_CHAT_TEMPLATE_FALCON_3;
+    } else if (tmpl_contains("<|user|>") && tmpl_contains("<|endoftext|>")) {
+        return LLM_CHAT_TEMPLATE_ZEPHYR;
+    } else if (tmpl_contains("bos_token + message['role']")) {
+        return LLM_CHAT_TEMPLATE_MONARCH;
+    } else if (tmpl_contains("<start_of_turn>")) {
+        return LLM_CHAT_TEMPLATE_GEMMA;
+    } else if (tmpl_contains("'\\n\\nAssistant: ' + eos_token")) {
+        // OrionStarAI/Orion-14B-Chat
+        return LLM_CHAT_TEMPLATE_ORION;
+    } else if (tmpl_contains("GPT4 Correct ")) {
+        // openchat/openchat-3.5-0106
+        return LLM_CHAT_TEMPLATE_OPENCHAT;
+    } else if (tmpl_contains("USER: ") && tmpl_contains("ASSISTANT: ")) {
+        // eachadea/vicuna-13b-1.1 (and Orca variant)
+        if (tmpl_contains("SYSTEM: ")) {
+            return LLM_CHAT_TEMPLATE_VICUNA_ORCA;
+        }
+        return LLM_CHAT_TEMPLATE_VICUNA;
+    } else if (tmpl_contains("### Instruction:") && tmpl_contains("<|EOT|>")) {
+        // deepseek-ai/deepseek-coder-33b-instruct
+        return LLM_CHAT_TEMPLATE_DEEPSEEK;
+    } else if (tmpl_contains("<|START_OF_TURN_TOKEN|>") && tmpl_contains("<|USER_TOKEN|>")) {
+        // CohereForAI/c4ai-command-r-plus
+        return LLM_CHAT_TEMPLATE_COMMAND_R;
+    } else if (tmpl_contains("<|start_header_id|>") && tmpl_contains("<|end_header_id|>")) {
+        return LLM_CHAT_TEMPLATE_LLAMA_3;
+    } else if (tmpl_contains("[gMASK]sop")) {
+        // chatglm3-6b
+        return LLM_CHAT_TEMPLATE_CHATGML_3;
+    } else if (tmpl_contains("[gMASK]<sop>")) {
+        return LLM_CHAT_TEMPLATE_CHATGML_4;
+    } else if (tmpl_contains(LU8("<用户>"))) {
+        // MiniCPM-3B-OpenHermes-2.5-v2-GGUF
+        return LLM_CHAT_TEMPLATE_MINICPM;
+    } else if (tmpl_contains("'Assistant: ' + message['content'] + eos_token")) {
+        return LLM_CHAT_TEMPLATE_DEEPSEEK_2;
+    } else if (tmpl_contains(LU8("<｜Assistant｜>")) && tmpl_contains(LU8("<｜User｜>")) && tmpl_contains(LU8("<｜end▁of▁sentence｜>"))) {
+         // original: if (tmpl_contains(LU8("'<｜Assistant｜>' + message['content'] + '<｜end▁of▁sentence｜>'"))) {
+        return LLM_CHAT_TEMPLATE_DEEPSEEK_3;
+    } else if (tmpl_contains("[|system|]") && tmpl_contains("[|assistant|]") && tmpl_contains("[|endofturn|]")) {
+        // ref: https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct/discussions/8#66bae61b1893d14ee8ed85bb
+        // EXAONE-3.0-7.8B-Instruct
+        return LLM_CHAT_TEMPLATE_EXAONE_3;
+    } else if (tmpl_contains("rwkv-world")) {
+        return LLM_CHAT_TEMPLATE_RWKV_WORLD;
+    } else if (tmpl_contains("<|start_of_role|>")) {
+        return LLM_CHAT_TEMPLATE_GRANITE;
+    } else if (tmpl_contains("message['role'] + additional_special_tokens[0] + message['content'] + additional_special_tokens[1]")) {
+        return LLM_CHAT_TEMPLATE_GIGACHAT;
+    } else if (tmpl_contains("<|role_start|>")) {
+        return LLM_CHAT_TEMPLATE_MEGREZ;
+    } else if (tmpl_contains("<|header_start|>") && tmpl_contains("<|header_end|>")) {
+        return LLM_CHAT_TEMPLATE_LLAMA4;
+    }
+    return LLM_CHAT_TEMPLATE_UNKNOWN;
+}
 
 static int32_t llama_chat_apply_template_internal(
     const llm_chat_template tmpl,

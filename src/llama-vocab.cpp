@@ -15,7 +15,7 @@
 //
 // helpers
 //
-
+/*
 static void replace_all(std::string & s, const std::string & search, const std::string & replace) {
     std::string result;
     for (size_t pos = 0; ; pos += search.length()) {
@@ -29,7 +29,7 @@ static void replace_all(std::string & s, const std::string & search, const std::
     }
     s = std::move(result);
 }
-
+*/
 LLAMA_ATTRIBUTE_FORMAT(1, 2)
 static std::string format(const char * fmt, ...) {
     va_list ap;
