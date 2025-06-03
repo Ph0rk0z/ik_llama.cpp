@@ -28,8 +28,8 @@ struct llama_sampler * llama_sampler_init_grammar_impl(
                       const char * grammar_str,
                       const char * grammar_root);
 
-struct llama_sampler * llama_sampler_init_infill_impl(
-        const struct llama_vocab & vocab);
+//struct llama_sampler * llama_sampler_init_infill_impl(
+//        const struct llama_vocab & vocab);
 
 struct llama_sampler * llama_sampler_init_dry_impl(
         const struct llama_vocab &  vocab,

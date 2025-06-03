@@ -7,13 +7,15 @@
 
 enum gpt_sampler_type {
     GPT_SAMPLER_TYPE_NONE        = 0,
-    GPT_SAMPLER_TYPE_TOP_K       = 1,
-    GPT_SAMPLER_TYPE_TOP_P       = 2,
-    GPT_SAMPLER_TYPE_MIN_P       = 3,
-    GPT_SAMPLER_TYPE_TFS_Z       = 4,
-    GPT_SAMPLER_TYPE_TYPICAL_P   = 5,
-    GPT_SAMPLER_TYPE_TEMPERATURE = 6,
-    GPT_SAMPLER_TYPE_XTC         = 7,
+    GPT_SAMPLER_TYPE_DRY         = 1,
+    GPT_SAMPLER_TYPE_TOP_K       = 2,
+    GPT_SAMPLER_TYPE_TOP_P       = 3,
+    GPT_SAMPLER_TYPE_MIN_P       = 4,
+    GPT_SAMPLER_TYPE_TFS_Z       = 5,
+    GPT_SAMPLER_TYPE_TYPICAL_P   = 6,
+    GPT_SAMPLER_TYPE_TEMPERATURE = 7,
+    GPT_SAMPLER_TYPE_XTC         = 8,
+    GPT_SAMPLER_TYPE_INFILL      = 9,
 };
 
 // sampling parameters
@@ -37,13 +39,20 @@ struct gpt_sampler_params {
     float   penalty_repeat    = 1.00f; // 1.0 = disabled
     float   penalty_freq      = 0.00f; // 0.0 = disabled
     float   penalty_present   = 0.00f; // 0.0 = disabled
+    float   dry_multiplier     = 0.0f;  // 0.0 = disabled;      DRY repetition penalty for tokens extending repetition:
+    float   dry_base           = 1.75f; // 0.0 = disabled;      multiplier * base ^ (length of sequence before token - allowed length)
+    int32_t dry_allowed_length = 2;     // tokens extending repetitions beyond this receive penalty
+    int32_t dry_penalty_last_n = -1;    // how many tokens to scan for repetitions (0 = disable penalty, -1 = context size)
     int32_t mirostat          = 0;     // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
     float   mirostat_tau      = 5.00f; // target entropy
     float   mirostat_eta      = 0.10f; // learning rate
     bool    penalize_nl       = false; // consider newlines as a repeatable token
     bool    ignore_eos        = false;
 
+    std::vector<std::string> dry_sequence_breakers = {"\n", ":", "\"", "*"};     // default sequence breakers for DRY
+
     std::vector<enum gpt_sampler_type> samplers = {
+        GPT_SAMPLER_TYPE_DRY,
         GPT_SAMPLER_TYPE_TOP_K,
         GPT_SAMPLER_TYPE_TFS_Z,
         GPT_SAMPLER_TYPE_TYPICAL_P,
