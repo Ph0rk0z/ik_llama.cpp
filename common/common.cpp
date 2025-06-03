@@ -600,6 +600,16 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         sparams.tfs_z = std::stof(argv[i]);
         return true;
     }
+    if (arg == "--xtc-probability") {
+        CHECK_ARG
+        sparams.xtc_probability = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--xtc-threshold") {
+        CHECK_ARG
+        sparams.xtc_threshold = std::stof(argv[i]);
+        return true;
+    }
     if (arg == "--typical") {
         CHECK_ARG
         sparams.typ_p = std::stof(argv[i]);
