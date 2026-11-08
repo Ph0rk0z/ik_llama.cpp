@@ -45,6 +45,12 @@
 
 #define IK_PRINT_TIMING 0
 
+// Set to 1 for a measurement build: accumulates the wall time every worker
+// spends inside ggml_barrier() and prints windowed totals to stderr from
+// ggml_graph_compute(). Keep the instrumentation identical across barrier
+// variants so wait-time deltas between builds are directly comparable.
+#define GGML_BARRIER_STATS 0
+
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -3203,6 +3209,32 @@ struct ggml_context_container {
     struct ggml_context context;
 };
 
+// Put hot synchronization fields on their own cache lines: every worker touches
+// them at every op boundary, so sharing a line between them causes heavy false
+// sharing (cf. https://github.com/ggml-org/llama.cpp/issues/9588, fixed upstream
+// in #9598 but never picked up by this fork).
+#if defined(_MSC_VER)
+#define GGML_BARRIER_ALIGN __declspec(align(64))
+#else
+#define GGML_BARRIER_ALIGN __attribute__((aligned(64)))
+#endif
+
+// Maximum workers supported by the NUMA-hierarchical barrier. Graphs with more
+// threads than this silently keep the flat barrier.
+#define GGML_NUMA_BARRIER_MAX_THREADS 256
+
+// Must match GGML_NUMA_MAX_NODES (defined alongside the NUMA topology code
+// further down); benign redefinition when both are seen.
+#ifndef GGML_NUMA_MAX_NODES
+#define GGML_NUMA_MAX_NODES 8
+#endif
+
+// One cache line per counter: workers of different nodes must not share lines.
+typedef struct {
+    GGML_BARRIER_ALIGN atomic_int arrived;
+    GGML_BARRIER_ALIGN atomic_int passed;
+} ggml_barrier_node_slot;
+
 struct ggml_compute_state_shared {
     const struct ggml_cgraph * cgraph;
     const struct ggml_cplan * cplan;
@@ -3211,15 +3243,38 @@ struct ggml_compute_state_shared {
     int n_batch;
 
     // synchronization primitives
-    atomic_int n_barrier;
-    atomic_int n_barrier_passed;
+    GGML_BARRIER_ALIGN atomic_int n_barrier;
+    GGML_BARRIER_ALIGN atomic_int n_barrier_passed;
 
     ggml_abort_callback abort_callback; // abort ggml_graph_compute when true
     void * abort_callback_data;
 
-    atomic_int current_chunk; // currently processing chunk during mul_mat, shared between all the threads
+    GGML_BARRIER_ALIGN atomic_int current_chunk; // currently processing chunk during mul_mat, shared between all the threads
 
     enum ggml_status ec;
+
+#if defined(__gnu_linux__)
+    // NUMA-hierarchical barrier (see ggml_barrier_numa_impl). The mapping is
+    // set up once by the main thread in ggml_graph_compute() before any worker
+    // starts, and is read-only afterwards. All barrier counters are per-graph,
+    // so graphs running concurrently on different threads never share state.
+    bool numa_hierarchical;                            // hierarchical barrier enabled for this graph
+    int  numa_active_nodes;                            // nodes holding at least one worker
+    int  numa_node_count[GGML_NUMA_MAX_NODES];         // workers per node
+    int  numa_node_of[GGML_NUMA_BARRIER_MAX_THREADS];  // worker ith -> node id
+    GGML_BARRIER_ALIGN ggml_barrier_node_slot nb_node[GGML_NUMA_MAX_NODES];
+    GGML_BARRIER_ALIGN atomic_int nb_g_arrived;
+    GGML_BARRIER_ALIGN atomic_int nb_g_passed;
+    // Stage 2a NUMA band split: per-node MoE chunk-stream counters. Indexed by
+    // node id; node k's stream enumerates its band of every used expert (see
+    // ggml_compute_forward_mul_mat_id). Seeded with k before each op barrier.
+    GGML_BARRIER_ALIGN atomic_int moe_chunk_next[GGML_NUMA_MAX_NODES];
+    // Stage 2b: workers that ran on a different node than the barrier map
+    // assigned them (drifted affinity, failed pin, cgroup shuffle). Non-zero
+    // means the MoE band split is streaming some of its weight rows across
+    // UPI even though placement is correct.
+    GGML_BARRIER_ALIGN atomic_int numa_node_mismatch;
+#endif
 };
 
 struct ggml_compute_state {
@@ -5039,6 +5094,7 @@ struct ggml_numa_nodes {
     uint32_t n_nodes;
     uint32_t total_cpus; // hardware threads on system
     uint32_t current_node; // node on which main process is execting
+    bool moe_band_split; // stage 2a: node-partitioned MoE chunk scheduling armed (see ggml_numa_moe_band_split_set)
 #if defined(__gnu_linux__)
     cpu_set_t cpuset; // cpuset from numactl
 #else
@@ -5066,6 +5122,95 @@ inline static void ggml_critical_section_start(void) {
         sched_yield();
     }
 }
+
+#if GGML_BARRIER_STATS
+static __thread int64_t   tls_bs_wait_ns; // per-thread barrier wait accumulator
+static __thread long long tls_bs_calls;   // per-thread barrier call count
+static atomic_llong g_bs_total_wait_ns;   // flushed to these every 1024 calls
+static atomic_llong g_bs_total_calls;
+
+static inline int64_t ggml_bs_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec*1000000000ll + (int64_t)ts.tv_nsec;
+}
+
+static inline void ggml_bs_record(int64_t wait_ns) {
+    tls_bs_wait_ns += wait_ns;
+    if (++tls_bs_calls >= 1024) {
+        atomic_fetch_add_explicit(&g_bs_total_wait_ns, tls_bs_wait_ns, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_bs_total_calls,   tls_bs_calls,    memory_order_relaxed);
+        tls_bs_wait_ns = 0;
+        tls_bs_calls   = 0;
+    }
+}
+#endif // GGML_BARRIER_STATS
+
+#if defined(__gnu_linux__)
+static __thread int tls_numa_node = -1; // worker's node for the current graph
+
+// Global phase of the hierarchical barrier: exactly one leader per node that
+// holds workers arrives here; the last leader opens the gate for every node.
+static void ggml_barrier_global_phase(struct ggml_compute_state_shared * shared) {
+    const int g_passed_old = atomic_load(&shared->nb_g_passed);
+
+    if (atomic_fetch_add(&shared->nb_g_arrived, 1) == shared->numa_active_nodes - 1) {
+        atomic_store(&shared->nb_g_arrived, 0);
+        atomic_fetch_add(&shared->nb_g_passed, 1);
+        return;
+    }
+
+    while (true) {
+        for (int i = 0; i < 100000; i++) {
+            if (atomic_load(&shared->nb_g_passed) != g_passed_old) {
+                return;
+            }
+        #if defined(__SSE3__)
+            _mm_pause();
+        #elif defined(__ARM_NEON)
+            __asm__ __volatile__("isb\n");
+        #endif
+        }
+        sched_yield();
+    }
+}
+
+// Two-level counting barrier: workers only contend on their own node's cache
+// lines; the last worker of each node joins one global phase and then opens
+// the gate for its node. Correct for any node mapping; performance depends on
+// the mapping matching where the threads actually run.
+static void ggml_barrier_numa_impl(struct ggml_compute_state_shared * shared) {
+    const int node         = tls_numa_node;
+    const int node_workers = shared->numa_node_count[node];
+
+    atomic_int * node_arrived = &shared->nb_node[node].arrived;
+    atomic_int * node_passed  = &shared->nb_node[node].passed;
+
+    const int node_passed_old = atomic_load(node_passed);
+
+    if (atomic_fetch_add(node_arrived, 1) == node_workers - 1) {
+        // last worker of this node: leader, join the global phase, then release
+        // this node's workers
+        ggml_barrier_global_phase(shared);
+        atomic_store(node_arrived, 0);
+        atomic_fetch_add(node_passed, 1);
+    } else {
+        while (true) {
+            for (int i = 0; i < 100000; i++) {
+                if (atomic_load(node_passed) != node_passed_old) {
+                    return;
+                }
+            #if defined(__SSE3__)
+                _mm_pause();
+            #elif defined(__ARM_NEON)
+                __asm__ __volatile__("isb\n");
+            #endif
+            }
+            sched_yield();
+        }
+    }
+}
+#endif // defined(__gnu_linux__)
 
 static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
@@ -5101,22 +5246,38 @@ static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) 
     }
 }
 
-#ifdef GGML_USE_OPENMP
-static void ggml_barrier(struct ggml_compute_state_shared * shared) {
+static void ggml_barrier_dispatch(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
         return;
     }
+#if defined(__gnu_linux__)
+    if (shared->numa_hierarchical) {
+        ggml_barrier_numa_impl(shared);
+        return;
+    }
+#endif
+#ifdef GGML_USE_OPENMP
     if (shared && shared->n_batch > 32) {
         ggml_barrier_impl(shared);
         return;
     }
     #pragma omp barrier
-}
 #else
-static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     ggml_barrier_impl(shared);
-}
 #endif
+}
+
+static void ggml_barrier(struct ggml_compute_state_shared * shared) {
+#if GGML_BARRIER_STATS
+    const int64_t bs_t0 = shared->n_threads > 1 ? ggml_bs_now() : 0;
+#endif
+    ggml_barrier_dispatch(shared);
+#if GGML_BARRIER_STATS
+    if (shared->n_threads > 1) {
+        ggml_bs_record(ggml_bs_now() - bs_t0);
+    }
+#endif
+}
 
 // TODO: make this somehow automatically executed
 //       some sort of "sentry" mechanism
@@ -5141,7 +5302,11 @@ static uint32_t ggml_get_numa_affinity(void) {
 
 void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     if (g_state.numa.n_nodes > 0) {
-        fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
+        // Already initialized. The topology never changes, so just adopt the
+        // requested strategy. Stage 2a: the expert band-split placement hook
+        // runs during model loading and may have initialized the topology
+        // before the caller's ggml_numa_init() gets a chance to run.
+        g_state.numa.numa_strategy = numa_flag;
 
         return;
     }
@@ -5229,6 +5394,155 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
 bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
+}
+
+#if defined(__gnu_linux__)
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+#ifndef MPOL_MF_MOVE
+#define MPOL_MF_MOVE (1 << 1)
+#endif
+
+static bool ggml_numa_band_has_cpus(int node) {
+    if (node < 0 || (uint32_t)node >= g_state.numa.n_nodes) {
+        return false;
+    }
+    const struct ggml_numa_node * n = &g_state.numa.nodes[node];
+    for (uint32_t i = 0; i < n->n_cpus; ++i) {
+        if (n->cpus[i] < CPU_SETSIZE && CPU_ISSET(n->cpus[i], &g_state.numa.cpuset)) {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
+// Stage 2a NUMA expert band-split support. The intended use (see src/llama.cpp)
+// is: with --no-mmap, bind the output-row bands of the MoE expert-weight stacks
+// node-local via ggml_numa_mbind_range(), then arm the node-partitioned chunk
+// scheduler with ggml_numa_moe_band_split_set(true). Bands are ranked by
+// ascending node id, and the compute side derives the same ranking from the
+// worker -> node map, so band k and the k-th active node always agree.
+
+int ggml_numa_band_count(void) {
+#if defined(__gnu_linux__)
+    if (g_state.numa.n_nodes == 0) {
+        return 0; // ggml_numa_init() has not been called
+    }
+    int count = 0;
+    for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+        count += ggml_numa_band_has_cpus(n);
+    }
+    return count;
+#else
+    return 0;
+#endif
+}
+
+int ggml_numa_band_node(int band) {
+#if defined(__gnu_linux__)
+    if (band < 0 || g_state.numa.n_nodes == 0) {
+        return -1;
+    }
+    int count = 0;
+    for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+        if (ggml_numa_band_has_cpus(n)) {
+            if (count == band) {
+                return (int)n;
+            }
+            ++count;
+        }
+    }
+#else
+    UNUSED(band);
+#endif
+    return -1;
+}
+
+bool ggml_numa_mbind_range(void * start, size_t size, int node) {
+#if defined(__gnu_linux__)
+    if (node < 0 || (uint32_t)node >= g_state.numa.n_nodes || size == 0 || start == NULL) {
+        return false;
+    }
+#ifdef SYS_mbind
+    const unsigned long node_mask = 1UL << node;
+    // MPOL_MF_MOVE so the binding also works if the pages were already
+    // faulted in; on a fresh buffer it is a no-op and the first touch
+    // allocates each band on its node.
+    return syscall(SYS_mbind, start, size, MPOL_BIND, &node_mask, sizeof(node_mask)*8, MPOL_MF_MOVE) == 0;
+#else
+    return false;
+#endif
+#else
+    UNUSED(start);
+    UNUSED(size);
+    UNUSED(node);
+    return false;
+#endif
+}
+
+void ggml_numa_moe_band_split_set(bool on) {
+    g_state.numa.moe_band_split = on;
+}
+
+bool ggml_numa_moe_band_split_enabled(void) {
+    return g_state.numa.moe_band_split;
+}
+
+// Parse the NUMA topology if nobody called ggml_numa_init() yet. Pure
+// topology discovery (nodes, CPU lists, affinity mask) - no strategy side
+// effects - so it is safe to call before model loading; a later
+// ggml_numa_init() with the real strategy just updates the stored strategy.
+void ggml_numa_ensure_topology(void) {
+#if defined(__gnu_linux__)
+    if (g_state.numa.n_nodes == 0) {
+        ggml_numa_init(g_state.numa.numa_strategy);
+    }
+#endif
+}
+
+// Node of the page containing `addr` (move_pages query mode), or -1 if the
+// kernel cannot tell (unmapped page, no kernel support, ...). Used by the
+// caller to verify that band placement actually took effect after loading.
+int ggml_numa_page_node(void * addr) {
+#if defined(__gnu_linux__)
+#ifdef SYS_move_pages
+    int status = -1;
+    if (syscall(SYS_move_pages, 0, 1, (void **)&addr, NULL, &status, 0) != 0) {
+        return -1;
+    }
+    return status;
+#else
+    UNUSED(addr);
+    return -1;
+#endif
+#else
+    UNUSED(addr);
+    return -1;
+#endif
+}
+
+// True if the task has an explicit MPOL_BIND memory policy (numactl --membind).
+// The band split must not override a policy the user asked for explicitly;
+// default and interleave policies are fine to specialize per range.
+bool ggml_numa_mem_policy_explicit_bind(void) {
+#if defined(__gnu_linux__)
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+#ifdef SYS_get_mempolicy
+    int policy = 0;
+    if (syscall(SYS_get_mempolicy, &policy, NULL, 0, 0, 0) != 0) {
+        return false;
+    }
+    return policy == MPOL_BIND;
+#else
+    return false;
+#endif
+#else
+    return false;
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -19134,8 +19448,121 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
+#if defined(__gnu_linux__) && defined(GGML_EXPERT_CHUNKING) && defined(GGML_USE_IQK_MULMAT)
+    // Stage 2a NUMA band split. When armed (placement side in src/llama.cpp),
+    // node k processes, for every used expert, the chunk range
+    // [k*C/N, (k+1)*C/N) of the ne01 output-row chunks, so every expert weight
+    // row a worker streams is resident on that worker's node. Pure work
+    // scheduling: the chunk set and the iqk kernels are untouched, and
+    // (expert, chunk) coverage is identical to the flat chunk stream.
+    const int bs_chunks = MAX(1, MIN(nth, (int)(ne01 / 32)));
+    int  bs_n    = 1;    // active NUMA nodes
+    int  bs_node = -1;   // this worker's node id
+    int  bs_band = -1;   // this node's band rank (ascending node id)
+    bool bs_on   = false;
+    if (params->shared->numa_hierarchical && g_state.numa.moe_band_split) {
+        bs_n    = params->shared->numa_active_nodes;
+        bs_node = tls_numa_node;
+        if (bs_n > 1 && bs_node >= 0 && bs_node < GGML_NUMA_MAX_NODES && bs_chunks >= bs_n) {
+            bs_band = 0;
+            for (int n = 0; n < bs_node; ++n) {
+                bs_band += params->shared->numa_node_count[n] > 0;
+            }
+            bs_on = true;
+        }
+    }
+
+    // Stage 2b: make engagement visible. Fires on the first chunked MoE op
+    // and then every 8192nd (always with GGML_NUMA_MOE_DEBUG=1), so a run log
+    // states unambiguously whether the band split is actually dispatching.
+    if (bs_on && ith == 0) {
+        static atomic_int s_ops = 0;
+        const bool s_debug = getenv("GGML_NUMA_MOE_DEBUG") != NULL;
+        const int seen = atomic_fetch_add_explicit(&s_ops, 1, memory_order_relaxed);
+        if (s_debug || seen < 2 || seen % 8192 == 0) {
+            fprintf(stderr, "[ggml] numa moe band split engaged: nodes=%d chunks/expert=%d experts=%d used<=%d tokens=%lld ('%s')\n",
+                    bs_n, (bs_chunks/bs_n)*bs_n, n_as, n_ids, (long long)ne11, ggml_get_name(src0));
+        }
+
+        // Stage 2b: one-shot runtime page probe. The load-time verify checks
+        // placement right after loading; this re-checks the very stack this
+        // op is about to stream, after cudaHostRegister/prefault/THP and
+        // anything else had a chance to move pages. Costs n_band*12
+        // move_pages queries, once per process. GGML_NUMA_MOE_PROBE=0 opts
+        // out.
+        {
+            const char * probe_env = getenv("GGML_NUMA_MOE_PROBE");
+            if (probe_env == NULL || probe_env[0] != '0') {
+                static atomic_int s_probe_done = 0;
+                int expected = 0;
+                if (atomic_compare_exchange_strong(&s_probe_done, &expected, 1)) {
+                    const int n_band = ggml_numa_band_count();
+                    const long pg = sysconf(_SC_PAGESIZE);
+                    if (n_band >= 2 && n_band <= 16 && pg > 0) {
+                        const int64_t   rows    = src0->ne[1];
+                        const size_t    rowb    = (size_t)src0->nb[1];
+                        const int64_t   n_exp   = src0->ne[2];
+                        const size_t    expb    = (size_t)src0->nb[2];
+                        const uintptr_t base    = (uintptr_t)src0->data;
+                        const uintptr_t pg_mask = ~((uintptr_t)pg - 1);
+                        char rep[512];
+                        size_t off = 0;
+                        int all_ok = 1;
+                        rep[0] = '\0';
+                        for (int k = 0; k < n_band; ++k) {
+                            const int64_t r0 = rows*k/n_band;
+                            const int64_t r1 = rows*(k + 1)/n_band;
+                            const int target = ggml_numa_band_node(k);
+                            int hits = 0, tot = 0;
+                            // Stage 2e fix: sample (expert, row) points across
+                            // the whole stack. The scheduler reads band-k rows
+                            // of every expert; sweeping expert 0's slab alone
+                            // (pre-2e) validated 1/n_expert of the bytes.
+                            for (int i = 0; i < 12; ++i) {
+                                const int64_t ex = (n_exp <= 12)
+                                    ? (i < n_exp ? i : n_exp - 1)
+                                    : (int64_t)((uint64_t)i * (uint64_t)n_exp / 12);
+                                const uintptr_t s = base + (size_t)ex*expb + (size_t)r0*rowb;
+                                const uintptr_t e = base + (size_t)ex*expb + (size_t)r1*rowb;
+                                const uintptr_t ps = (s + (uintptr_t)pg - 1) & pg_mask;
+                                const uintptr_t pe = e & pg_mask;
+                                if (pe <= ps) {
+                                    continue;
+                                }
+                                const uintptr_t p = (ps + (pe - ps)*(uintptr_t)i/12) & pg_mask;
+                                const int node = ggml_numa_page_node((void *)p);
+                                ++tot;
+                                if (node == target) {
+                                    ++hits;
+                                }
+                            }
+                            if (tot > 0 && hits < tot) {
+                                all_ok = 0;
+                            }
+                            off += (size_t)snprintf(rep + off, sizeof(rep) - off, "%sband%d->node%d: %d/%d",
+                                                    k > 0 ? ", " : "", k, target, hits, tot);
+                        }
+                        fprintf(stderr, "[ggml] numa moe runtime probe '%s': %s%s\n",
+                                ggml_get_name(src0), rep, all_ok ? "" :
+                                "  [!] pages moved after load - band split is streaming remote memory");
+                    }
+                }
+            }
+        }
+    }
+#endif
+
     if (ith == 0) {
         atomic_store(&params->shared->current_chunk, nth);
+#if defined(__gnu_linux__) && defined(GGML_EXPERT_CHUNKING) && defined(GGML_USE_IQK_MULMAT)
+        if (bs_on) {
+            // Seed node k's stream counter with k so that the first fetch_add
+            // of node k yields stream item 0 (mirrors current_chunk = nth).
+            for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+                atomic_store(&params->shared->moe_chunk_next[n], n);
+            }
+        }
+#endif
     }
 
     ggml_barrier(params->shared);
@@ -19146,13 +19573,49 @@ static void ggml_compute_forward_mul_mat_id(
         const void * wdata_mm    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size_mm = ggml_row_size(vec_dot_type, ne10);
 
-        const int chunks_per_expert = MAX(1, MIN(nth, (int)(ne01 / 32)));
+        int chunks_per_expert = MAX(1, MIN(nth, (int)(ne01 / 32)));
+#if defined(__gnu_linux__) && defined(GGML_EXPERT_CHUNKING) && defined(GGML_USE_IQK_MULMAT)
+        if (bs_on) {
+            chunks_per_expert = (chunks_per_expert / bs_n) * bs_n; // equal bands per node
+        }
+#endif
 
         int total_chunks = 0;
         for (int a = 0; a < n_as; a++) {
             if (matrix_row_counts[a] > 0) total_chunks += chunks_per_expert;
         }
 
+#if defined(__gnu_linux__) && defined(GGML_EXPERT_CHUNKING) && defined(GGML_USE_IQK_MULMAT)
+        if (bs_on) {
+            // Node k pulls from its own stream: stream item v maps to the
+            // (v / per_node)-th used expert, chunk bs_band*per_node + v%per_node.
+            const int per_node = chunks_per_expert / bs_n;
+            const int n_items  = total_chunks / bs_n; // n_used * per_node
+            int u_found = -1, a_found = -1; // cached used-expert walk state
+            int chunk = atomic_fetch_add(&params->shared->moe_chunk_next[bs_node], 1) - bs_node;
+            for (;;) {
+                if (chunk >= n_items) {
+                    return;
+                }
+                const int u = chunk / per_node;
+                while (u_found < u) {
+                    do { ++a_found; } while (matrix_row_counts[a_found] == 0);
+                    ++u_found;
+                }
+
+                const char * src0_cur = (const char *) src0->data + a_found*nb02;
+
+                if (!iqk_mul_mat_moe(ne01, matrix_row_counts[a_found], ne00, ne11,
+                            src0->type, src0_cur, nb01,
+                            vec_dot_type, (const char *)wdata_mm, row_size_mm,
+                            (float *)dst->data, nb1, nb2,
+                            matrix_rows + a_found*ne12,
+                            bs_band*per_node + (chunk - u*per_node), chunks_per_expert)) goto IQK_MulMat_Not_Available0;
+
+                chunk = atomic_fetch_add(&params->shared->moe_chunk_next[bs_node], 1) - bs_node;
+            }
+        }
+#endif
         int chunk_id = ith;
         while (chunk_id < total_chunks) {
             // Map global chunk_id to (expert_index, local_chunk_index)
@@ -19469,8 +19932,51 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
 #if defined GGML_EXPERT_CHUNKING
 
+    const int64_t nr0_base = src0_2 ? ne01 : ne01/2;
+
+#if defined(__gnu_linux__)
+    // Stage 2a NUMA band split (see ggml_compute_forward_mul_mat_id).
+    const int bs_chunks = MAX(1, MIN(nth, (int)(nr0_base / 32)));
+    int  bs_n    = 1;    // active NUMA nodes
+    int  bs_node = -1;   // this worker's node id
+    int  bs_band = -1;   // this node's band rank (ascending node id)
+    bool bs_on   = false;
+    if (params->shared->numa_hierarchical && g_state.numa.moe_band_split) {
+        bs_n    = params->shared->numa_active_nodes;
+        bs_node = tls_numa_node;
+        if (bs_n > 1 && bs_node >= 0 && bs_node < GGML_NUMA_MAX_NODES && bs_chunks >= bs_n) {
+            bs_band = 0;
+            for (int n = 0; n < bs_node; ++n) {
+                bs_band += params->shared->numa_node_count[n] > 0;
+            }
+            bs_on = true;
+        }
+    }
+
+    // Stage 2b: engagement log for the fused up/gate path (see
+    // ggml_compute_forward_mul_mat_id for the rationale).
+    if (bs_on && ith == 0) {
+        static atomic_int s_ops = 0;
+        const bool s_debug = getenv("GGML_NUMA_MOE_DEBUG") != NULL;
+        const int seen = atomic_fetch_add_explicit(&s_ops, 1, memory_order_relaxed);
+        if (s_debug || seen < 2 || seen % 8192 == 0) {
+            fprintf(stderr, "[ggml] numa moe band split engaged (up/gate): nodes=%d chunks/expert=%d experts=%d tokens=%lld ('%s')\n",
+                    bs_n, (bs_chunks/bs_n)*bs_n, n_as, (long long)ne11, ggml_get_name(src0_1));
+        }
+    }
+#endif
+
     if (ith == 0) {
         atomic_store(&params->shared->current_chunk, nth);
+#if defined(__gnu_linux__)
+        if (bs_on) {
+            // Seed node k's stream counter with k so that the first fetch_add
+            // of node k yields stream item 0 (mirrors current_chunk = nth).
+            for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+                atomic_store(&params->shared->moe_chunk_next[n], n);
+            }
+        }
+#endif
     }
 
     ggml_barrier(params->shared);
@@ -19481,14 +19987,64 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
     const void * wdata_ug    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size_ug = ggml_row_size(vec_dot_type, ne10);
-    const int64_t nr0_base = src0_2 ? ne01 : ne01/2;
 
-    const int chunks_per_expert_ug = MAX(1, MIN(nth, (int)(nr0_base / 32)));
+    int chunks_per_expert_ug = MAX(1, MIN(nth, (int)(nr0_base / 32)));
+#if defined(__gnu_linux__)
+    if (bs_on) {
+        chunks_per_expert_ug = (chunks_per_expert_ug / bs_n) * bs_n; // equal bands per node
+    }
+#endif
 
     int total_chunks_ug = 0;
     for (int a = 0; a < n_as; a++) {
         if (matrix_row_counts[a] > 0) total_chunks_ug += chunks_per_expert_ug;
     }
+
+#if defined(__gnu_linux__)
+    if (bs_on) {
+        // Node k pulls from its own stream (see ggml_compute_forward_mul_mat_id).
+        const int per_node = chunks_per_expert_ug / bs_n;
+        const int n_items  = total_chunks_ug / bs_n; // n_used * per_node
+        int u_found = -1, a_found = -1; // cached used-expert walk state
+        int chunk = atomic_fetch_add(&params->shared->moe_chunk_next[bs_node], 1) - bs_node;
+        for (;;) {
+            if (chunk >= n_items) {
+                return;
+            }
+            const int u = chunk / per_node;
+            while (u_found < u) {
+                do { ++a_found; } while (matrix_row_counts[a_found] == 0);
+                ++u_found;
+            }
+
+            const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
+            if (src0_2) {
+                src0_1_cur = (const char *) src0_1->data + a_found*nb02;
+                src0_2_cur = (const char *) src0_2->data + a_found*nb02;
+                up_b_cur   = up_b   ? (const char *)up_b->data + a_found*nb41 : NULL;
+                gate_b_cur = gate_b ? (const char *)gate_b->data + a_found*nb51 : NULL;
+            } else {
+                src0_2_cur = (const char *) src0_1->data + a_found*nb02;
+                src0_1_cur = src0_2_cur + nb02/2;
+                if (up_b) {
+                    GGML_ASSERT(!gate_b);
+                    gate_b_cur = (const char *)up_b->data + a_found*nb41;
+                    up_b_cur   = gate_b_cur + nb41/2;
+                }
+            }
+
+            if (!iqk_moe_fused_up_gate(nr0_base, matrix_row_counts[a_found], ne00, ne11, dst->op_params[0],
+                                type, src0_1_cur, src0_2_cur, nb01,
+                                vec_dot_type, (const char *)wdata_ug, row_size_ug,
+                                up_b_cur, gate_b_cur,
+                                (float *)dst->data, nb1, nb2,
+                                matrix_rows + a_found*ne12, limit, situ_beta, situ_beta_linear,
+                                bs_band*per_node + (chunk - u*per_node), chunks_per_expert_ug)) GGML_ABORT("fatal error");
+
+            chunk = atomic_fetch_add(&params->shared->moe_chunk_next[bs_node], 1) - bs_node;
+        }
+    }
+#endif
 
     int last_a = 0;
     int last_acc = 0;
@@ -29653,6 +30209,22 @@ static void clear_numa_thread_affinity(void) {
     CPU_FREE(cpus);
 }
 
+// NUMA node containing logical CPU `cpu`, or -1 if unknown/not mapped.
+static int ggml_numa_node_of_cpu(int cpu) {
+    if (cpu < 0) {
+        return -1;
+    }
+    for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+        const struct ggml_numa_node * node = &g_state.numa.nodes[n];
+        for (uint32_t i = 0; i < node->n_cpus; ++i) {
+            if (node->cpus[i] == (uint32_t)cpu) {
+                return (int)n;
+            }
+        }
+    }
+    return -1;
+}
+
 // pin worker `thread_n` to its assigned logical CPU (no-op without affinity)
 static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) {
     if (cplan == NULL || cplan->cpu_affinity == NULL || cplan->n_cpu_affinity <= 0) {
@@ -30191,6 +30763,118 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
     return cplan;
 }
 
+// Stage 2c: TG phase profiler. Runtime-gated by GGML_TG_PROFILE=1; measures,
+// on worker 0 only, the wall time of every graph node's forward (bucketed by
+// op) and the per-node barrier wait, then prints per-call and per-window
+// averages. Worker 0's timeline is (forward_i + barrier_wait_i) contiguous
+// over the whole pass, so the sums are the true wall time of the CPU graph
+// segment(s); the difference to the benchmark's token wall time is what the
+// GPU + backend-scheduler sync are eating. GGML_TG_PROFILE_MS (default 2000)
+// sets the report window.
+// Stage 2c round 2: also accumulate gap_ns - wall time between consecutive
+// graph computes (segments) on the calling thread. cpu_total + gap == wall
+// exactly (a window starts at its first graph_begin), so gaps expose per-row
+// stalls (CUDA graph re-capture at KV bucket changes, sched sync, sampling)
+// that a pure cpu-percentage read cannot attribute.
+#define GGML_TGP_CLASSES 5 // mul_mat_id, moe_fused_up_gate, mul_mat, add, other
+
+struct ggml_tgp_state {
+    int64_t   ns[GGML_TGP_CLASSES];
+    long long calls[GGML_TGP_CLASSES];
+    int64_t   barrier_ns;
+    int64_t   gap_ns;
+    long long graphs;
+    int64_t   window_t0;
+};
+
+static struct ggml_tgp_state g_tgp;
+static int64_t g_tgp_last_end; // graph end stamp of the calling thread
+
+static inline int64_t ggml_tgp_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000ll + (int64_t)ts.tv_nsec;
+}
+
+static bool ggml_tgp_enabled(void) {
+    static int s_state = -1; // benign race: both writers store the same value
+    if (s_state < 0) {
+        s_state = getenv("GGML_TG_PROFILE") != NULL ? 1 : 0;
+    }
+    return s_state != 0;
+}
+
+static int64_t ggml_tgp_window_ns(void) {
+    static int64_t s_ns = 0; // benign race: idempotent
+    if (s_ns == 0) {
+        const char * env = getenv("GGML_TG_PROFILE_MS");
+        long v = env ? atol(env) : 2000;
+        if (v < 100) {
+            v = 100;
+        }
+        s_ns = v * 1000000ll;
+    }
+    return s_ns;
+}
+
+static void ggml_tgp_accum(const struct ggml_tensor * node, int64_t span_ns) {
+    int c;
+    switch (node->op) {
+        case GGML_OP_MUL_MAT_ID:        c = 0; break;
+        case GGML_OP_MOE_FUSED_UP_GATE: c = 1; break;
+        case GGML_OP_MUL_MAT:           c = 2; break;
+        case GGML_OP_ADD:               c = 3; break;
+        default:                        c = 4; break;
+    }
+    g_tgp.ns[c]    += span_ns;
+    g_tgp.calls[c] += 1;
+}
+
+static inline void ggml_tgp_graph_begin(void) {
+    const int64_t now = ggml_tgp_now();
+    if (g_tgp.window_t0 == 0) {
+        g_tgp.window_t0 = now;
+    } else if (g_tgp_last_end != 0) {
+        g_tgp.gap_ns += now - g_tgp_last_end; // wall outside CPU graph segments
+    }
+}
+
+static void ggml_tgp_report(int64_t now_ns) {
+    static const char * names[GGML_TGP_CLASSES] = {
+        "mul_mat_id", "up_gate", "mul_mat", "add", "other",
+    };
+    const double ms = 1e6; // ns -> ms
+
+    int64_t total = g_tgp.barrier_ns;
+    for (int i = 0; i < GGML_TGP_CLASSES; ++i) {
+        total += g_tgp.ns[i];
+    }
+
+    const double wall_ms = (now_ns - g_tgp.window_t0) / ms;
+    fprintf(stderr, "[tg-profile] graphs=%lld wall=%.1f ms | cpu_total=%.1f ms (%.1f%%) | gap=%.1f ms (%.1f%%) | barrier=%.1f ms | per-call ms(calls):",
+            g_tgp.graphs, wall_ms, total / ms, wall_ms > 0 ? 100.0 * total / (wall_ms * ms) : 0.0,
+            g_tgp.gap_ns / ms, wall_ms > 0 ? 100.0 * (double)g_tgp.gap_ns / (wall_ms * ms) : 0.0,
+            g_tgp.barrier_ns / ms);
+    for (int i = 0; i < GGML_TGP_CLASSES; ++i) {
+        fprintf(stderr, " %s=%.3f(%lld)", names[i],
+                g_tgp.calls[i] ? (double)g_tgp.ns[i] / g_tgp.calls[i] / ms : 0.0,
+                g_tgp.calls[i]);
+    }
+    fprintf(stderr, "\n");
+
+    memset(&g_tgp, 0, sizeof(g_tgp));
+    g_tgp.window_t0 = now_ns;
+}
+
+static inline void ggml_tgp_graph_end(void) {
+    g_tgp.graphs++;
+    const int64_t now = ggml_tgp_now();
+    g_tgp_last_end = now;
+    if (g_tgp.window_t0 != 0 && now - g_tgp.window_t0 >= ggml_tgp_window_ns()) {
+        ggml_tgp_report(now);
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
@@ -30200,6 +30884,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     set_numa_thread_affinity(state->ith);
     set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
 
+#if defined(__gnu_linux__)
+    tls_numa_node = state->shared->numa_hierarchical ? state->shared->numa_node_of[state->ith] : -1;
+
+    // Stage 2b: the barrier map is only as good as the pin behind it. Sample
+    // the CPU this worker actually landed on and count mismatches against the
+    // map; ggml_graph_compute() reports them (rate-limited) at graph end.
+    if (state->shared->numa_hierarchical) {
+        const int actual_node = ggml_numa_node_of_cpu(sched_getcpu());
+        if (actual_node >= 0 && actual_node != state->shared->numa_node_of[state->ith]) {
+            atomic_fetch_add_explicit(&state->shared->numa_node_mismatch, 1, memory_order_relaxed);
+        }
+    }
+#endif
+
     struct ggml_compute_params params = {
         /*.ith   =*/ state->ith,
         /*.nth   =*/ state->shared->n_threads,
@@ -30207,6 +30905,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata =*/ cplan->work_data,
         /*.shared=*/ state->shared,
     };
+
+    // Stage 2c: TG phase profiler (worker 0 only, runtime-gated, ~zero cost
+    // when GGML_TG_PROFILE is unset).
+    const bool tgp_on = ggml_tgp_enabled() && state->ith == 0;
+    int64_t tgp_b0 = 0;
+    if (tgp_on) {
+        ggml_tgp_graph_begin();
+    }
 
 #if IK_PRINT_TIMING
     int64_t t_start = ggml_time_us();
@@ -30221,7 +30927,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
 #endif
+        const int64_t tgp_t0 = tgp_on ? ggml_tgp_now() : 0;
         node_n = ggml_compute_forward(&params, node, cgraph, node_n);
+        if (tgp_on) {
+            ggml_tgp_accum(node, ggml_tgp_now() - tgp_t0);
+            tgp_b0 = ggml_tgp_now();
+        }
 #if IK_PRINT_TIMING
         int64_t tim2 = ggml_time_us();
         t_eval += tim2 - tim1;
@@ -30233,9 +30944,17 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         ggml_barrier(state->shared);
 
+        if (tgp_on) {
+            g_tgp.barrier_ns += ggml_tgp_now() - tgp_b0;
+        }
+
         if (state->shared->ec != GGML_STATUS_SUCCESS) {
             break;
         }
+    }
+
+    if (tgp_on) {
+        ggml_tgp_graph_end();
     }
 #if IK_PRINT_TIMING
     int64_t t_end = ggml_time_us();
@@ -30271,7 +30990,57 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         /*.abort_callback_data     =*/ NULL,
         /*.current_chunk           =*/ 0,
         /*.ec                      =*/ GGML_STATUS_SUCCESS,
+#if defined(__gnu_linux__)
+        /*.numa_hierarchical       =*/ false,
+        /*.numa_active_nodes       =*/ 0,
+        /*.numa_node_count         =*/ {0},
+        /*.numa_node_of            =*/ {0},
+        /*.nb_node                 =*/ {{0}},
+        /*.nb_g_arrived            =*/ 0,
+        /*.nb_g_passed             =*/ 0,
+        /*.moe_chunk_next         =*/ {0},
+        /*.numa_node_mismatch     =*/ 0,
+#endif
     };
+
+#if defined(__gnu_linux__)
+    // Enable the NUMA-hierarchical barrier when every worker can be assigned to
+    // a NUMA node up front: via explicit per-CPU affinity (highest precedence,
+    // the same mapping set_cpu_thread_affinity() applies) or via --numa
+    // distribute, which pins worker t to node t % n_nodes. Every other
+    // configuration keeps the flat barrier.
+    if (ggml_is_numa() && g_state.numa.n_nodes > 1 && n_threads > 1 && n_threads <= GGML_NUMA_BARRIER_MAX_THREADS) {
+        bool numa_ok = true;
+        for (int t = 0; t < n_threads; ++t) {
+            int node = -1;
+            if (cplan->cpu_affinity != NULL && cplan->n_cpu_affinity > 0) {
+                node = ggml_numa_node_of_cpu(cplan->cpu_affinity[t % cplan->n_cpu_affinity]);
+            } else if (g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_DISTRIBUTE) {
+                node = t % (int)g_state.numa.n_nodes;
+            }
+            if (node < 0 || node >= (int)g_state.numa.n_nodes) {
+                numa_ok = false;
+                break;
+            }
+            state_shared.numa_node_of[t] = node;
+            state_shared.numa_node_count[node]++;
+        }
+        if (numa_ok) {
+            int numa_active = 0;
+            for (int n = 0; n < (int)g_state.numa.n_nodes; ++n) {
+                numa_active += state_shared.numa_node_count[n] > 0;
+            }
+            state_shared.numa_active_nodes = numa_active;
+            state_shared.numa_hierarchical = true;
+            static bool numa_notice = false;
+            if (!numa_notice) {
+                numa_notice = true;
+                fprintf(stderr, "[ggml] NUMA-hierarchical barrier enabled: %d worker(s) over %d active node(s)\n",
+                        n_threads, numa_active);
+            }
+        }
+    }
+#endif
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
@@ -30336,6 +31105,43 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         }
     }
 #endif
+
+#if defined(__gnu_linux__)
+    // Stage 2b: report workers that ran off their mapped node during this
+    // graph. Zero here means the barrier map matches reality and every MoE
+    // band-split chunk pull is node-local by construction.
+    {
+        const int mism = atomic_load_explicit(&state_shared.numa_node_mismatch, memory_order_relaxed);
+        if (mism > 0) {
+            static long long s_mism_graphs = 0;
+            s_mism_graphs++;
+            if (s_mism_graphs == 1 || s_mism_graphs % 512 == 0) {
+                fprintf(stderr, "[ggml] numa: %d/%d worker(s) ran on a different node than mapped this graph - MoE band split streams weight rows across UPI (graphs with mismatches so far: %lld; logged at first, then every 512th)\n",
+                        mism, n_threads, s_mism_graphs);
+            }
+        }
+    }
+#endif
+
+#if GGML_BARRIER_STATS
+    {
+        static uint64_t bs_graphs = 0;
+        static long long bs_last_wait = 0;
+        static long long bs_last_calls = 0;
+        const long long bs_w = (long long)atomic_load_explicit(&g_bs_total_wait_ns, memory_order_relaxed);
+        const long long bs_c = (long long)atomic_load_explicit(&g_bs_total_calls,   memory_order_relaxed);
+        bs_graphs++;
+        if (bs_graphs % 256 == 0) {
+            const long long bs_dw = bs_w - bs_last_wait;
+            const long long bs_dc = bs_c - bs_last_calls;
+            fprintf(stderr, "[barrier-stats] graphs=%llu wait_ms=%.2f calls=%lld avg_wait_ns=%.0f\n",
+                    (unsigned long long)bs_graphs, (double)bs_dw/1e6, bs_dc,
+                    bs_dc > 0 ? (double)bs_dw/(double)bs_dc : 0.0);
+            bs_last_wait  = bs_w;
+            bs_last_calls = bs_c;
+        }
+    }
+#endif // GGML_BARRIER_STATS
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
