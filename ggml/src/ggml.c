@@ -19479,7 +19479,7 @@ static void ggml_compute_forward_mul_mat_id(
         static atomic_int s_ops = 0;
         const bool s_debug = getenv("GGML_NUMA_MOE_DEBUG") != NULL;
         const int seen = atomic_fetch_add_explicit(&s_ops, 1, memory_order_relaxed);
-        if (s_debug || seen < 2 || seen % 8192 == 0) {
+        if (s_debug && (seen < 2 || seen % 8192 == 0)) {
             fprintf(stderr, "[ggml] numa moe band split engaged: nodes=%d chunks/expert=%d experts=%d used<=%d tokens=%lld ('%s')\n",
                     bs_n, (bs_chunks/bs_n)*bs_n, n_as, n_ids, (long long)ne11, ggml_get_name(src0));
         }
@@ -19959,7 +19959,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         static atomic_int s_ops = 0;
         const bool s_debug = getenv("GGML_NUMA_MOE_DEBUG") != NULL;
         const int seen = atomic_fetch_add_explicit(&s_ops, 1, memory_order_relaxed);
-        if (s_debug || seen < 2 || seen % 8192 == 0) {
+        if (s_debug && (seen < 2 || seen % 8192 == 0)) {
             fprintf(stderr, "[ggml] numa moe band split engaged (up/gate): nodes=%d chunks/expert=%d experts=%d tokens=%lld ('%s')\n",
                     bs_n, (bs_chunks/bs_n)*bs_n, n_as, (long long)ne11, ggml_get_name(src0_1));
         }
