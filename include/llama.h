@@ -390,6 +390,12 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    enum llama_nvfp4_precision {
+        LLAMA_NVFP4_PRECISION_AUTO = 0,
+        LLAMA_NVFP4_PRECISION_W4A4 = 1,
+        LLAMA_NVFP4_PRECISION_INT8 = 2,
+    };
+
     struct llama_model_params {
         // comma separated list of devices to use for offloading
         const char* devices;
@@ -450,6 +456,7 @@ extern "C" {
 
         // separate GGUF with the n-gram tables (per-layer token embedding, Engram), NULL if none
         const char * ngram_file;
+        enum llama_nvfp4_precision nvfp4_precision;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;    // only load the vocabulary, no weights
@@ -595,6 +602,7 @@ extern "C" {
         bool only_repack;                    // Only repack tensors
         bool dry_run;                        //
         bool partial_requant;                // quantize only missing split files in the split quantized .gguf destination directory
+        bool estimate_imatrix;               // If true, use an estimated imatrix, possibly combining with the input imatrix
         size_t slab_size;                    // tensors larger than this many bytes of f32 are processed in slabs of up to this size (at least one slice or row group), 0 = never
         bool cuda_quantize;                  // quantize IQ4_KT, IQ3_KT, IQ2_KT, IQ1_KT, IQ3_KS, IQ4_KS, IQ4_KS_R4, IQ4_KS_R16, IQ5_KS, and IQ5_KS_R4 on a CUDA device
         int  cuda_quantize_device;           // CUDA device index used by --cuda-quantize (default 0)
@@ -1747,6 +1755,11 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state);
 
     LLAMA_API bool llama_reload_changed_tensors(struct llama_context * ctx);
+
+    LLAMA_API uint32_t llama_compute_analytical_imatrix(
+            const char * fname_inp,
+            const char * fname_out,
+            const llama_model_quantize_params * params);
 
 #ifdef __cplusplus
 }
