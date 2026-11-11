@@ -3210,6 +3210,7 @@ struct ggml_compute_state_shared {
     int  numa_active_nodes;                            // nodes holding at least one worker
     int  numa_node_count[GGML_NUMA_MAX_NODES];         // workers per node
     int  numa_node_of[GGML_NUMA_BARRIER_MAX_THREADS];  // worker ith -> node id
+    int  numa_node_rank_of[GGML_NUMA_BARRIER_MAX_THREADS]; // worker ith -> rank among its node's workers (stage 3a)
     GGML_BARRIER_ALIGN ggml_barrier_node_slot nb_node[GGML_NUMA_MAX_NODES];
     GGML_BARRIER_ALIGN atomic_int nb_g_arrived;
     GGML_BARRIER_ALIGN atomic_int nb_g_passed;
@@ -5043,6 +5044,7 @@ struct ggml_numa_nodes {
     uint32_t total_cpus; // hardware threads on system
     uint32_t current_node; // node on which main process is execting
     bool moe_band_split; // stage 2a: node-partitioned MoE chunk scheduling armed (see ggml_numa_moe_band_split_set)
+    bool dense_band_split; // stage 3a: dense-matmul row-band dispatch armed (see ggml_numa_dense_band_split_set)
 #if defined(__gnu_linux__)
     cpu_set_t cpuset; // cpuset from numactl
 #else
@@ -5096,6 +5098,7 @@ static inline void ggml_bs_record(int64_t wait_ns) {
 
 #if defined(__gnu_linux__)
 static __thread int tls_numa_node = -1; // worker's node for the current graph
+static __thread int tls_numa_rank = -1; // worker's rank among its node's workers (stage 3a)
 
 // Global phase of the hierarchical barrier: exactly one leader per node that
 // holds workers arrives here; the last leader opens the gate for every node.
@@ -5436,6 +5439,15 @@ void ggml_numa_moe_band_split_set(bool on) {
 
 bool ggml_numa_moe_band_split_enabled(void) {
     return g_state.numa.moe_band_split;
+}
+
+// Stage 3a: dense band dispatch arm/disarm (see ggml_numa_dense_split_rows).
+void ggml_numa_dense_band_split_set(bool on) {
+    g_state.numa.dense_band_split = on;
+}
+
+bool ggml_numa_dense_band_split_enabled(void) {
+    return g_state.numa.dense_band_split;
 }
 
 // Parse the NUMA topology if nobody called ggml_numa_init() yet. Pure
@@ -19064,6 +19076,88 @@ static inline uint32_t simple_gcd(uint32_t a, uint32_t b) {
     return a;
 }
 
+// Stage 3a: dense band dispatch. The Stage 2a MoE split partitions expert
+// stacks by (expert, output-row-chunk); this is the same row-band partition
+// for plain mul_mat: node k computes only output-row band k of the weight,
+// so every weight row a worker streams is resident on that worker's node
+// (placement side: llama_numa_bandsplit_place and llama_numa_dense_place in
+// src/llama.cpp). A band is a row-disjoint work partition, so results are
+// identical to the flat path regardless of where the pages actually sit.
+// `align` is the weight type's kernel column granularity; band edges are
+// rounded up to multiples of it (the last band keeps the raw tail), which
+// keeps bands disjoint, their union complete, and every band start aligned.
+// A band that collapses to nothing under rounding leaves band >= 0 with an
+// empty range - the caller must then skip the op on this node (its rows were
+// absorbed by the previous band), NOT fall back to the global partition.
+struct ggml_numa_dense_split {
+    int     band; // this thread's node's band rank among active nodes, -1 = run stock
+    int     ith;  // rank of this thread among its node's workers
+    int     nth;  // workers on this node
+    int64_t r0;   // first src0 row of this band
+    int64_t r1;   // one past the last src0 row of this band
+};
+
+static struct ggml_numa_dense_split ggml_numa_dense_split_rows(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0,
+        int64_t align) {
+
+    struct ggml_numa_dense_split s;
+    s.band = -1; s.ith = 0; s.nth = 1; s.r0 = 0; s.r1 = src0->ne[1];
+
+#if defined(__gnu_linux__)
+    if (!params->shared->numa_hierarchical ||
+        !g_state.numa.moe_band_split || !g_state.numa.dense_band_split) {
+        return s;
+    }
+    const int n_band = ggml_numa_band_count();
+    const int node   = tls_numa_node;
+    if (n_band < 2 || node < 0 || node >= GGML_NUMA_MAX_NODES || tls_numa_rank < 0) {
+        return s;
+    }
+    // Shape gate, mirror of llama_numa_dense_place(): plain 2D weight with
+    // packed rows and at least ~1 MiB per band. Splitting a tensor that was
+    // never placed is still correct - only the locality is missing - so the
+    // gate stays shape-only on purpose (no name matching in the hot path).
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) return s;
+    if (src0->ne[1] < 2*n_band) return s;
+    if (src0->nb[0] != ggml_type_size(src0->type)) return s;
+    if (src0->nb[1] != ggml_row_size(src0->type, src0->ne[0])) return s;
+    if ((size_t)(src0->ne[1]/n_band)*src0->nb[1] < (size_t)1*1024*1024) return s;
+
+    // band rank of this node: active nodes with a lower node id
+    int band = 0;
+    for (int n = 0; n < node; ++n) {
+        band += params->shared->numa_node_count[n] > 0;
+    }
+    if (band >= n_band) return s;
+
+    const int64_t rows = src0->ne[1];
+    if (align < 1) align = 1;
+    int64_t r0 = (rows * band) / n_band;
+    int64_t r1 = (band == n_band - 1) ? rows : (rows * (band + 1)) / n_band;
+    if (r0 % align) r0 += align - r0 % align;
+    if (band != n_band - 1 && r1 % align) r1 += align - r1 % align;
+    if (r0 > rows) r0 = rows;
+    if (r1 > rows) r1 = rows;
+
+    s.band = band;
+    s.ith  = tls_numa_rank;
+    s.nth  = params->shared->numa_node_count[node];
+    s.r0   = r0;
+    s.r1   = r1;
+    if (s.nth < 1) {
+        // degenerate map: run stock rather than guess a partition
+        s.band = -1; s.ith = 0; s.nth = 1; s.r0 = 0; s.r1 = rows;
+    }
+#else
+    UNUSED(params);
+    UNUSED(align);
+#endif
+
+    return s;
+}
+
 static int ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst,
@@ -19111,6 +19205,47 @@ static int ggml_compute_forward_mul_mat(
 
 #if GGML_USE_IQK_MULMAT
     if (dst->type == GGML_TYPE_F32) {
+#if defined(__gnu_linux__)
+        // Stage 3a: dense band dispatch - node k computes only its row band
+        // of the weight (lambda above). If the kernel refuses the restricted
+        // view, retry the full range with the node-local partition: refusals
+        // can differ per node because band widths differ, and every row is
+        // then computed at least once under any per-node refusal mix (rows
+        // written twice carry identical values).
+        const struct ggml_numa_dense_split ds = ggml_numa_dense_split_rows(params, src0, matmul_num_cols);
+        if (ds.band >= 0) {
+            if (ds.r1 <= ds.r0) {
+                // this node holds no rows of this op; the other node covers
+                // them in its own restricted call
+                return node_n;
+            }
+            if (iqk_mul_mat_4d(ds.r1 - ds.r0, ne11, ne00,
+                        ne02, ne03, ne12, ne13, nb02, nb03, nb12, nb13, nb2/sizeof(float), nb3/sizeof(float),
+                        src0->type, (const char *)src0->data + ds.r0*nb01, nb01,
+                        src1->type, src1->data, nb11,
+                        (float *)dst->data + ds.r0, nb1/sizeof(float), ds.ith, ds.nth)) {
+                if (ith == 0) {
+                    static atomic_int s_dense_ops = 0;
+                    const bool s_debug = getenv("GGML_NUMA_MOE_DEBUG") != NULL;
+                    const int seen = atomic_fetch_add_explicit(&s_dense_ops, 1, memory_order_relaxed);
+                    if (s_debug && (seen < 2 || seen % 8192 == 0)) {
+                        fprintf(stderr, "[ggml] numa dense band split engaged: nodes=%d band=%d rows=[%lld,%lld) of %lld ('%s')\n",
+                                params->shared->numa_active_nodes, ds.band,
+                                (long long)ds.r0, (long long)ds.r1, (long long)ne01, ggml_get_name(src0));
+                    }
+                }
+                return node_n;
+            }
+            if (iqk_mul_mat_4d(ne01, ne11, ne00,
+                        ne02, ne03, ne12, ne13, nb02, nb03, nb12, nb13, nb2/sizeof(float), nb3/sizeof(float),
+                        src0->type, src0->data, nb01,
+                        src1->type, src1->data, nb11,
+                        (float *)dst->data, nb1/sizeof(float), ds.ith, ds.nth)) return node_n;
+            // kernel does not handle this op at all; that decision is
+            // type/shape based and identical on every node, so the stock
+            // global-partition path below stays safe.
+        }
+#endif
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, nb12, nb13, nb2/sizeof(float), nb3/sizeof(float),
                     src0->type, src0->data, nb01,
@@ -19181,6 +19316,93 @@ static int ggml_compute_forward_mul_mat(
 
     if (src1->type != vec_dot_type && dst->type == GGML_TYPE_F32) {
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+#if defined(__gnu_linux__)
+        // Stage 3a: dense band dispatch on the wdata path (and its fused
+        // followers). Same contract as the direct-4d site above.
+        const struct ggml_numa_dense_split ds = ggml_numa_dense_split_rows(params, src0, matmul_num_cols);
+        if (ds.band >= 0) {
+            if (ds.r1 <= ds.r0) {
+                return node_n; // this node holds no rows of this op
+            }
+            if (iqk_mul_mat_4d(ds.r1 - ds.r0, ne11, ne00,
+                        ne02, ne03, ne12, ne13, nb02, nb03, row_size*ne11, row_size*ne11*ne12,
+                        nb2/sizeof(float), nb3/sizeof(float),
+                        src0->type, (const char *)src0->data + ds.r0*nb01, nb01,
+                        vec_dot_type, wdata, row_size,
+                        (float *)dst->data + ds.r0, nb1/sizeof(float), ds.ith, ds.nth)) {
+                if (!cgraph) return node_n;
+                while (node_n < cgraph->n_nodes - 1 &&
+                       cgraph->nodes[node_n+1]->op == GGML_OP_MUL_MAT &&
+                       cgraph->nodes[node_n+1]->src[1] == src1 &&
+                       type_traits[cgraph->nodes[node_n+1]->src[0]->type].vec_dot_type == vec_dot_type) {
+                    struct ggml_tensor * dst_next  = cgraph->nodes[node_n+1];
+                    struct ggml_tensor * src0_next = dst_next->src[0];
+                    GGML_ASSERT(dst_next->type == GGML_TYPE_F32);
+                    GGML_ASSERT(src0_next->ne[0] == ne00);
+                    //if (ith == 0) printf("Fusing %s\n", src0_next->name);
+                    // each follower has its own row count, so re-derive its band
+                    const struct ggml_numa_dense_split dsn = ggml_numa_dense_split_rows(params, src0_next, matmul_num_cols);
+                    if (dsn.band >= 0 && dsn.r1 > dsn.r0) {
+                        if (!iqk_mul_mat_4d(dsn.r1 - dsn.r0, ne11, ne00,
+                            src0_next->ne[2], src0_next->ne[3], ne12, ne13, src0_next->nb[2], src0_next->nb[3], row_size*ne11, row_size*ne11*ne12,
+                            dst_next->nb[2]/sizeof(float), dst_next->nb[3]/sizeof(float),
+                            src0_next->type, (const char *)src0_next->data + dsn.r0*src0_next->nb[1], src0_next->nb[1],
+                            vec_dot_type, wdata, row_size,
+                            (float *)dst_next->data + dsn.r0, dst_next->nb[1]/sizeof(float), dsn.ith, dsn.nth)) {
+                            // restricted view refused: full range, node-local
+                            // partition (complete under any refusal mix)
+                            if (!iqk_mul_mat_4d(src0_next->ne[1], ne11, ne00,
+                                src0_next->ne[2], src0_next->ne[3], ne12, ne13, src0_next->nb[2], src0_next->nb[3], row_size*ne11, row_size*ne11*ne12,
+                                dst_next->nb[2]/sizeof(float), dst_next->nb[3]/sizeof(float),
+                                src0_next->type, src0_next->data, src0_next->nb[1],
+                                vec_dot_type, wdata, row_size,
+                                (float *)dst_next->data, dst_next->nb[1]/sizeof(float), dsn.ith, dsn.nth)) break;
+                        }
+                    } else if (dsn.band < 0) {
+                        // follower too small to split: run it flat, exactly stock
+                        if (!iqk_mul_mat_4d(src0_next->ne[1], ne11, ne00,
+                            src0_next->ne[2], src0_next->ne[3], ne12, ne13, src0_next->nb[2], src0_next->nb[3], row_size*ne11, row_size*ne11*ne12,
+                            dst_next->nb[2]/sizeof(float), dst_next->nb[3]/sizeof(float),
+                            src0_next->type, src0_next->data, src0_next->nb[1],
+                            vec_dot_type, wdata, row_size,
+                            (float *)dst_next->data, dst_next->nb[1]/sizeof(float), ith, nth)) break;
+                    }
+                    // dsn.band >= 0 with an empty band: this node holds no rows
+                    // of the follower; the previous band absorbed them, so the
+                    // other node computes the follower in full. Advance node_n
+                    // like every other thread.
+                    ++node_n;
+                }
+                return node_n;
+            }
+            // restricted view refused: full range, node-local partition
+            if (iqk_mul_mat_4d(ne01, ne11, ne00,
+                        ne02, ne03, ne12, ne13, nb02, nb03, row_size*ne11, row_size*ne11*ne12,
+                        nb2/sizeof(float), nb3/sizeof(float),
+                        src0->type, src0->data, nb01,
+                        vec_dot_type, wdata, row_size,
+                        (float *)dst->data, nb1/sizeof(float), ds.ith, ds.nth)) {
+                if (!cgraph) return node_n;
+                while (node_n < cgraph->n_nodes - 1 &&
+                       cgraph->nodes[node_n+1]->op == GGML_OP_MUL_MAT &&
+                       cgraph->nodes[node_n+1]->src[1] == src1 &&
+                       type_traits[cgraph->nodes[node_n+1]->src[0]->type].vec_dot_type == vec_dot_type) {
+                    struct ggml_tensor * dst_next  = cgraph->nodes[node_n+1];
+                    struct ggml_tensor * src0_next = dst_next->src[0];
+                    if (!iqk_mul_mat_4d(src0_next->ne[1], ne11, ne00,
+                        src0_next->ne[2], src0_next->ne[3], ne12, ne13, src0_next->nb[2], src0_next->nb[3], row_size*ne11, row_size*ne11*ne12,
+                        dst_next->nb[2]/sizeof(float), dst_next->nb[3]/sizeof(float),
+                        src0_next->type, src0_next->data, src0_next->nb[1],
+                        vec_dot_type, wdata, row_size,
+                        (float *)dst_next->data, dst_next->nb[1]/sizeof(float), ds.ith, ds.nth)) break;
+                    ++node_n;
+                }
+                return node_n;
+            }
+            // kernel refuses this op entirely (identical on every node);
+            // fall through to the stock global-partition path below
+        }
+#endif
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, row_size*ne11, row_size*ne11*ne12,
                     nb2/sizeof(float), nb3/sizeof(float),
@@ -19259,6 +19481,40 @@ static int ggml_compute_forward_mul_mat(
     if ((ggml_n_dims(src0) == 2) && gemv) {
         const void * src1_wdata      = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t src1_col_stride = ggml_is_contiguous(src1) || src1->type != vec_dot_type ? ggml_row_size(vec_dot_type, ne10) : nb11;
+#if defined(__gnu_linux__)
+        // Stage 3a: node k's threads partition band k of the rows. Band edges
+        // are already rounded up to matmul_num_cols by the splitter, so only
+        // interior thread edges need rounding here: start up, end down, and
+        // the last local thread keeps the tail so the band stays complete.
+        const struct ggml_numa_dense_split ds = ggml_numa_dense_split_rows(params, src0, matmul_num_cols);
+        if (ds.band >= 0) {
+            const int64_t span = ds.r1 - ds.r0;
+            if (span <= 0) {
+                return node_n; // this node holds no rows of this op
+            }
+            int64_t s0 = ds.r0 + (span * ds.ith) / ds.nth;
+            int64_t s1 = ds.r0 + (span * (ds.ith + 1)) / ds.nth;
+            if (s0 % matmul_num_cols) {
+                s0 += matmul_num_cols - s0 % matmul_num_cols;
+            }
+            if (ds.ith < ds.nth - 1 && s1 % matmul_num_cols) {
+                s1 -= s1 % matmul_num_cols;
+            }
+            if (s0 >= s1) return node_n;
+
+            // If there are more than three rows in src1, use gemm; otherwise, use gemv.
+            if (gemm && (ne11 > 3)) {
+                gemm(ne00, (float *)((char *) dst->data) + s0, ne01, (const char *) src0->data + s0 * nb01,
+                     (const char *) src1_wdata, ne11 - ne11 % 4, s1 - s0);
+            }
+            for (int iter = gemm ? ne11 - ne11 % 4 : 0; iter < ne11; iter++) {
+                gemv(ne00, (float *)((char *) dst->data + (iter * nb1)) + s0, ne01,
+                     (const char *) src0->data + s0 * nb01, (const char *) src1_wdata + (src1_col_stride * iter), 1,
+                     s1 - s0);
+            }
+            return node_n;
+        }
+#endif
         int64_t src0_start = (ith * ne01) / nth;
         int64_t src0_end   = ((ith + 1) * ne01) / nth;
         src0_start = (src0_start % matmul_num_cols) ? src0_start + matmul_num_cols - (src0_start % matmul_num_cols): src0_start;
@@ -20180,6 +20436,36 @@ static void ggml_compute_forward_mul_mat_up_gate(
 
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
+#if defined(__gnu_linux__)
+    // Stage 3a: dense fused up/gate band dispatch. src0_1 and src0_2 share
+    // shape and layout (asserted above), so one row split drives both. They
+    // are placed as separate tensors, but band k of each binds to the same
+    // node, so this partition streams both locally. Same refusal ladder as
+    // the plain-mul_mat sites: banded view, then full range with the
+    // node-local partition, then the stock call keeps its abort contract.
+    {
+        const struct ggml_numa_dense_split ds = ggml_numa_dense_split_rows(params, src0_1, type_traits[type].ncols);
+        if (ds.band >= 0) {
+            if (ds.r1 <= ds.r0) {
+                return; // this node holds no rows of this op
+            }
+            if (iqk_moe_fused_up_gate(ds.r1 - ds.r0, ne11, ne00, ne11, dst->op_params[0],
+                         type, (const char *)src0_1->data + ds.r0*nb01, (const char *)src0_2->data + ds.r0*nb01, nb01,
+                         vec_dot_type, (const char *)wdata, row_size,
+                         NULL, NULL,
+                         (float *)dst->data + ds.r0, nb1, nb2,
+                         NULL, limit, situ_beta, situ_beta_linear, ds.ith, ds.nth)) return;
+            if (iqk_moe_fused_up_gate(ne01, ne11, ne00, ne11, dst->op_params[0],
+                         type, src0_1->data, src0_2->data, nb01,
+                         vec_dot_type, (const char *)wdata, row_size,
+                         NULL, NULL,
+                         (float *)dst->data, nb1, nb2,
+                         NULL, limit, situ_beta, situ_beta_linear, ds.ith, ds.nth)) return;
+            // kernel refuses this type entirely (identical on every node);
+            // the stock call below keeps its abort contract
+        }
+    }
+#endif
     if (!iqk_moe_fused_up_gate(ne01, ne11, ne00, ne11, dst->op_params[0],
                          type, src0_1->data, src0_2->data, nb01,
                          vec_dot_type, (const char *)wdata, row_size,
@@ -30853,6 +31139,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
 #if defined(__gnu_linux__)
     tls_numa_node = state->shared->numa_hierarchical ? state->shared->numa_node_of[state->ith] : -1;
+    tls_numa_rank = state->shared->numa_hierarchical ? state->shared->numa_node_rank_of[state->ith] : -1;
 
     // Stage 2b: the barrier map is only as good as the pin behind it. Sample
     // the CPU this worker actually landed on and count mismatches against the
@@ -30990,6 +31277,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 break;
             }
             state_shared.numa_node_of[t] = node;
+            state_shared.numa_node_rank_of[t] = state_shared.numa_node_count[node];
             state_shared.numa_node_count[node]++;
         }
         if (numa_ok) {

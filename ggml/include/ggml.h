@@ -999,6 +999,16 @@ extern "C" {
     GGML_API int   ggml_numa_page_node(void * addr);
     GGML_API bool  ggml_numa_mem_policy_explicit_bind(void);
 
+    // Stage 3a: dense band dispatch. Same row-band scheme as the MoE split,
+    // applied to plain (non-expert) 2D matmul weights - attention
+    // projections, dense FFN, shared experts, lm_head. Arming happens in
+    // llama_numa_bandsplit_place() after the dense tensors were placed
+    // (GGML_NUMA_DENSE_SPLIT=0 keeps them on the default page policy); the
+    // compute side then partitions each eligible mul_mat by output-row bands
+    // (see ggml_numa_dense_split_rows in ggml.c).
+    GGML_API void  ggml_numa_dense_band_split_set(bool on);
+    GGML_API bool  ggml_numa_dense_band_split_enabled(void);
+
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
     GGML_API void    ggml_print_objects(const struct ggml_context * ctx);
 
