@@ -3724,9 +3724,12 @@ class DFlash2DraftModel(DFlashDraftModel):
             self.gguf_writer.add_uint32(f"{self.gguf_writer.arch}.vocab_size_unpadded",
                                         self._get_target_hparams()["unpadded_vocab_size"])
         target_layers = [int(value) + (0 if inkling else 1) for value in target_layer_ids]
+        sources = self.hparams.get("target_feature_sources") or dflash_cfg.get("target_feature_sources") or []
+        if any(str(source) == "final_postnorm" for source in sources):
+            target_layers.append(1000)  # final output norm, not an execution layer
         if (mode := dflash_cfg.get("selector_softcap_mode")) is not None:
             self.gguf_writer.add_string(f"{self.gguf_writer.arch}.selector_softcap_mode", mode)
-        if not target_layers or any(value <= 0 for value in target_layers):
+        if not target_layers or any(value < 0 for value in target_layers) or target_layers.count(1000) > 1:
             raise ValueError("DFlash2DraftModel conversion requires target_layer_ids metadata")
         if len(set(target_layers)) != len(target_layers):
             raise ValueError("DFlash2DraftModel conversion requires unique target_layer_ids metadata")
@@ -9143,9 +9146,23 @@ class Raon1Model(Model):
         self.gguf_writer.add_hyper_connection_count(self._with_default(hp, "raon_mhc_streams", 4))
         self.gguf_writer.add_hyper_connection_epsilon(self._with_default(hp, "raon_mhc_selector_eps", 1e-5))
         self.gguf_writer.add_hyper_connection_magnitude(self._with_default(hp, "raon_mhc_post_factor", 2.0))
+        # Optional reasoning-effort steering (absent from the preview).
+        # "none" means unsteered (alpha 0).
+        steering = hp.get("reasoning_effort_steering") or {}
+        alpha = steering.get("alpha") or {}
+        levels = [(name, float(value)) for name, value in alpha.items() if name != "none"]
+        if levels:
+            self.gguf_writer.add_reasoning_effort(
+                steering.get("layers", []),
+                [name for name, _ in levels],
+                [value for _, value in levels],
+                steering.get("default", "high"),
+            )
         self.gguf_writer.add_file_type(self.ftype)
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int):
+        if new_name.endswith(".ffn_effort_steer.weight"):
+            return gguf.GGMLQuantizationType.F32
         if ".hc_" in new_name and not new_name.endswith("_fn.weight"):
             return gguf.GGMLQuantizationType.F32
         quantized = tuple(t for t in (
@@ -9181,6 +9198,11 @@ class Raon1Model(Model):
             for kind, tensor in (("FN", fn), ("BASE", base), ("SCALE", scale)):
                 yield self.format_tensor_name(getattr(gguf.MODEL_TENSOR, f"{prefix}_{kind}"), bid), tensor
             del self._mhc[bid, site]
+            return
+
+        if name.endswith(".moe.reasoning_effort_steering"):
+            assert bid is not None
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.FFN_EFFORT_STEER, bid), data_torch.float()
             return
 
         if ".moe.experts." in name:

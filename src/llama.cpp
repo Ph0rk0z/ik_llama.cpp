@@ -2669,7 +2669,18 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
 static void restore_recurrent_cache_tensors(int step, uint32_t slot, ggml_backend_sched_t sched,
         size_t ssm_bytes, size_t conv_bytes,
         ggml_tensor * s_l, ggml_tensor * per_step_ssm, ggml_tensor * per_step_conv,
-        std::unordered_set<ggml_backend_t> & backends_to_sync) {
+        std::unordered_set<ggml_backend_t> & backends_to_sync,
+        std::vector<ggml_host_copy_range> * host_copies) {
+    if (host_copies && s_l->buffer && per_step_ssm->buffer && per_step_conv->buffer &&
+        ggml_backend_buffer_is_host(s_l->buffer) && ggml_backend_buffer_is_host(per_step_ssm->buffer) &&
+        ggml_backend_buffer_is_host(per_step_conv->buffer)) {
+        const size_t slot_off = slot * s_l->nb[1];
+        host_copies->push_back({ (char *) s_l->data + slot_off + conv_bytes,
+                                 (const char *) per_step_ssm->data + (size_t) step * ssm_bytes, ssm_bytes });
+        host_copies->push_back({ (char *) s_l->data + slot_off,
+                                 (const char *) per_step_conv->data + (size_t) step * conv_bytes, conv_bytes });
+        return;
+    }
     auto dst_backend = ggml_backend_sched_get_tensor_backend(sched, s_l);
     auto dst = *s_l;
     const size_t slot_off = slot * dst.nb[1];
@@ -2697,6 +2708,8 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
     }
 
     std::unordered_set<ggml_backend_t> backends_to_sync;
+    // host-resident states are collected and copied at once, in parallel, after the loop
+    std::vector<ggml_host_copy_range> host_copies;
     const uint32_t n_layer = (uint32_t) s_l.size();
 
     for (uint32_t il = 0; il < n_layer; ++il) {
@@ -2746,7 +2759,7 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
                 (size_t) ckpt.per_step_max_allocated * sizeof(float);
             restore_recurrent_cache_tensors(step, slot, sched, ssm_bytes, conv_bytes,
                 s_l[il], per_step_ssm.front(), per_step_conv.front(),
-                backends_to_sync);
+                backends_to_sync, &host_copies);
         } else {
             auto split_sl = (const ggml_split_tensor_t *) s_l[il]->extra;
             for (int id = 0; id < split_sl->n_device; ++id) {
@@ -2760,7 +2773,7 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
                     (size_t) ckpt.per_step_max_allocated * sizeof(float);
                 restore_recurrent_cache_tensors(step, slot, sched, ssm_bytes, conv_bytes,
                     split_sl->splits[id], (ggml_tensor *) per_step_ssm_tensor,
-                    (ggml_tensor *) per_step_conv_tensor, backends_to_sync);
+                    (ggml_tensor *) per_step_conv_tensor, backends_to_sync, nullptr);
             }
         }
     }
@@ -2768,6 +2781,15 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
     // TODO: do we need to synchronize here?
     for (auto backend : backends_to_sync) {
         ggml_backend_synchronize(backend);
+    }
+
+    size_t host_bytes = 0;
+    for (const auto & c : host_copies) host_bytes += c.bytes;
+    if (host_bytes >= (1u << 20) && ggml_parallel_host_copy(host_copies.data(), (int) host_copies.size())) {
+        host_copies.clear();
+    }
+    for (const auto & c : host_copies) {
+        memcpy(c.dst, c.src, c.bytes);
     }
 
     return true;
@@ -7323,6 +7345,25 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         auto tim2 = ggml_time_us();
         printf("set_inputs(scale): %d us\n", int(tim2-tim1));
 #endif
+    }
+
+    if (lctx.inp_reasoning_effort) {
+        GGML_ASSERT(ggml_nelements(lctx.inp_reasoning_effort) >= batch.n_tokens);
+        auto & data = lctx.reasoning_effort_data;
+        data.resize(batch.n_tokens);
+
+        for (int64_t j = 0; j < batch.n_tokens; ++j) {
+            float alpha = lctx.model.reasoning_effort_default_alpha;
+            if (batch.seq_id && batch.seq_id[j]) {
+                auto it = lctx.reasoning_effort_by_seq.find(batch.seq_id[j][0]);
+                if (it != lctx.reasoning_effort_by_seq.end()) {
+                    alpha = it->second;
+                }
+            }
+            data[j] = alpha;
+        }
+        ggml_backend_tensor_set(lctx.inp_reasoning_effort, data.data(), 0,
+                data.size() * sizeof(float));
     }
 
     if (hparams.causal_attn || cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
@@ -12746,14 +12787,17 @@ static uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint
     return (uint32_t) std::min<uint64_t>(kv_rows, n_rows);
 }
 
+// rows per stream of the largest tensor: with shared streams the index-key owners do not all
+// have the same number of rows, and each tensor saves min(its own rows, this count)
 static uint32_t dsv4_cache_stream_rows(const std::vector<ggml_tensor *> & vec, uint32_t n_stream) {
     n_stream = std::max<uint32_t>(1, n_stream);
+    uint32_t rows = 0;
     for (const auto * t : vec) {
         if (t != nullptr && t->ne[1] % n_stream == 0) {
-            return (uint32_t)(t->ne[1] / n_stream);
+            rows = std::max(rows, (uint32_t)(t->ne[1] / n_stream));
         }
     }
-    return 0;
+    return rows;
 }
 
 // Compute per-stream byte offset and size for a DSV4 cache tensor.
@@ -14939,7 +14983,15 @@ static size_t llama_state_seq_load_file_internal(struct llama_context * ctx, con
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
             return 0;
         }
-        GGML_ASSERT(nread <= state_size);
+        if (nread != state_size) {
+            LLAMA_LOG_ERROR("%s: did not read all of the sequence state file data! size %zu, got %zu\n", __func__, state_size, nread);
+            if (dest_seq_id == -1) {
+                llama_kv_cache_clear(ctx);
+            } else {
+                llama_kv_cache_seq_rm(ctx, dest_seq_id, -1, -1);
+            }
+            return 0;
+        }
         GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
     }
 
@@ -14992,6 +15044,35 @@ void llama_set_abort_callback(struct llama_context * ctx, bool (*abort_callback)
 
 void llama_set_embeddings(struct llama_context * ctx, bool embeddings) {
     ctx->cparams.embeddings = embeddings;
+}
+
+bool llama_set_reasoning_effort(struct llama_context * ctx, llama_seq_id seq_id, const char * level) {
+    const auto & model = ctx->model;
+    if (!model.has_reasoning_effort_steering()) {
+        return true; // model does not steer: nothing to do
+    }
+
+    float alpha = model.reasoning_effort_default_alpha;
+    if (level != nullptr && level[0] != '\0' && strcmp(level, "default") != 0) {
+        if (strcmp(level, "none") == 0) {
+            alpha = 0.0f;
+        } else {
+            bool found = false;
+            for (size_t i = 0; i < model.reasoning_effort_names.size(); ++i) {
+                if (model.reasoning_effort_names[i] == level) {
+                    alpha = model.reasoning_effort_alphas[i];
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return false;
+            }
+        }
+    }
+
+    ctx->reasoning_effort_by_seq[seq_id] = alpha;
+    return true;
 }
 
 void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn) {
@@ -16249,6 +16330,10 @@ llama_token llama_sample_token_mirostat_v2(struct llama_context * ctx, llama_tok
 
 llama_token llama_sample_token_greedy(struct llama_context * ctx, llama_token_data_array * candidates) {
     return llama_sample_token_greedy_impl(ctx ? &ctx->sampling : nullptr, candidates);
+}
+
+llama_token llama_sample_token_greedy_logits(struct llama_context * ctx, const float * logits, int32_t n_logits) {
+    return llama_sample_token_greedy_logits_impl(ctx ? &ctx->sampling : nullptr, logits, n_logits);
 }
 
 llama_token llama_sample_token_with_rng(struct llama_context * ctx, llama_token_data_array * candidates, std::mt19937 & rng) {

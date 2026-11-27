@@ -10,6 +10,7 @@ FROM ${BASE_CUDA_DEV_CONTAINER} AS build
 ARG CUDA_DOCKER_ARCH="75-virtual;80-virtual;86-real;89-real"
 ARG GGML_NATIVE=ON
 ARG USE_CCACHE=true
+ARG NVFATBIN_LDS=/app/docker/nvfatbin.lds
 
 # Environment variables for portability and GitHub Actions
 ENV CCACHE_DIR=/ccache
@@ -20,7 +21,7 @@ ENV CCACHE_BASEDIR=/app
 
 RUN apt-get update && \
     apt-get install -yq --no-install-recommends \
-    ca-certificates build-essential libcurl4-openssl-dev curl libgomp1 cmake ccache git && \
+    ca-certificates build-essential libcurl4-openssl-dev curl libgomp1 cmake ccache git lld && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy non-hidden files first
@@ -40,7 +41,8 @@ RUN --mount=type=cache,target=/ccache \
         -DGGML_CUDA=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_DOCKER_ARCH}" \
         -DLLAMA_CURL=ON \
-        -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined && \
+        -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--script=${NVFATBIN_LDS}" \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined -fuse-ld=lld -Wl,--script=${NVFATBIN_LDS}" && \
     cmake --build build --config Release -j$(nproc) && \
     if [ "${USE_CCACHE}" = "true" ]; then \
         ccache -s; \

@@ -2,6 +2,7 @@
 #include "llama-hparams.h"
 #include "llama-model-loader.h"
 #include "llama-model.h"
+#include "llama-spec-features-dflash.h"
 
 #include <algorithm>
 #include <cmath>
@@ -105,10 +106,12 @@ static bool load_dflash_target_layer_ids(
     return true;
 }
 
-static void llama_hparams_normalize_dflash_target_layer_ids(llama_hparams & hparams, const char * model_kind) {
+static void llama_hparams_normalize_dflash_target_layer_ids(llama_hparams & hparams, [[maybe_unused]] const char * model_kind) {
     for (uint32_t i = 0; i < hparams.dflash_n_target_layers; ++i) {
         if (hparams.dflash_target_layer_ids[i] == 0) {
-            throw std::runtime_error(format("%s: target_layers must use one-based IDs", model_kind));
+            // 0 marks the final output norm rather than an execution layer
+            hparams.dflash_target_layer_ids[i] = (uint32_t) LLAMA_DFLASH_FINAL_LAYER_ID;
+            continue;
         }
         --hparams.dflash_target_layer_ids[i];
     }
@@ -1127,6 +1130,28 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,      hparams.dsv4_hc_mult, false);
                 ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,    hparams.dsv4_hc_eps, false);
                 ml.get_key(LLM_KV_HYPER_CONNECTION_MAGNITUDE,  hparams.hc_magnitude, false);
+
+                // Optional reasoning-effort steering levels (absent from the preview).
+                ml.get_arr(LLM_KV_REASONING_EFFORT_LAYERS, model.reasoning_effort_layers, false);
+                ml.get_arr(LLM_KV_REASONING_EFFORT_NAMES,  model.reasoning_effort_names,  false);
+                ml.get_arr(LLM_KV_REASONING_EFFORT_ALPHA,  model.reasoning_effort_alphas, false);
+                ml.get_key(LLM_KV_REASONING_EFFORT_DEFAULT, model.reasoning_effort_default, false);
+                if (model.reasoning_effort_names.size() != model.reasoning_effort_alphas.size()) {
+                    LLAMA_LOG_WARN("%s: ignoring incomplete reasoning-effort metadata\n", __func__);
+                    model.reasoning_effort_names.clear();
+                    model.reasoning_effort_alphas.clear();
+                }
+                if (!model.reasoning_effort_names.empty()) {
+                    if (model.reasoning_effort_default.empty()) {
+                        model.reasoning_effort_default = "high";
+                    }
+                    for (size_t i = 0; i < model.reasoning_effort_names.size(); ++i) {
+                        if (model.reasoning_effort_names[i] == model.reasoning_effort_default) {
+                            model.reasoning_effort_default_alpha = model.reasoning_effort_alphas[i];
+                            break;
+                        }
+                    }
+                }
 
                 if (hparams.ssm_d_state == 0) {
                     hparams.ssm_d_state = 128;

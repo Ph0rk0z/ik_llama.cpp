@@ -1207,6 +1207,39 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     slot.sparams = default_sparams;
     auto& data = task.data;
     const llama_vocab* vocab = llama_model_get_vocab(model);
+
+    // request field, then chat_template_kwargs, then server default
+    auto effort_from_json = [](const json & obj) -> std::string {
+        if (!obj.is_object()) {
+            return {};
+        }
+        const auto it = obj.find("reasoning_effort");
+        return it != obj.end() && it->is_string() ? it->get<std::string>() : std::string();
+    };
+    std::string reasoning_effort = json_value(data, "reasoning_effort", std::string());
+    if (reasoning_effort.empty()) {
+        const auto it = data.find("chat_template_kwargs");
+        if (it != data.end()) {
+            reasoning_effort = effort_from_json(*it);
+        }
+    }
+    if (reasoning_effort.empty()) {
+        const auto it = params_base.default_template_kwargs.find("reasoning_effort");
+        if (it != params_base.default_template_kwargs.end()) {
+            try {
+                reasoning_effort = json::parse(it->second).get<std::string>();
+            } catch (const std::exception &) {
+                // not a string; the template parser will report it if it matters
+            }
+        }
+    }
+    if (reasoning_effort.empty()) {
+        reasoning_effort = params_base.reasoning_effort;
+    }
+    if (!llama_set_reasoning_effort(ctx, slot.id, reasoning_effort.empty() ? nullptr : reasoning_effort.c_str())) {
+        send_error(task, "Error: invalid reasoning_effort: '" + reasoning_effort + "'", ERROR_TYPE_INVALID_REQUEST);
+        return false;
+    }
     if (data.count("__oaicompat") != 0) {
         slot.oaicompat = true;
         slot.oaicompat_model = task.params.oaicompat_model;
@@ -1963,6 +1996,28 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
         }
     }
 
+    // the request's expiring logit bias goes into slot.sparams before the sampler copies them:
+    // the states built below index the sampler's own elb_params
+    {
+        const auto& expiring_logit_bias = data.find("expiring_logit_bias");
+        if (expiring_logit_bias != data.end() && expiring_logit_bias->is_array()) {
+            // has new params from api
+            std::string content;
+            for (const auto& line: data["expiring_logit_bias"]) {
+                if (line.is_string()) {
+                    content += line.get<std::string>() + "\n";
+                }
+            }
+            try {
+                argparse_expiring_logit_bias(content, slot.sparams);
+            } catch (const std::invalid_argument& e) {
+                std::cerr << e.what() << '\n';
+            } catch (const std::out_of_range& e) {
+                std::cerr << e.what() << '\n';
+            }
+        }
+    }
+
     {
         try
         {
@@ -1985,34 +2040,14 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
 
     do  // populate expiring logit bias
     {
-        const auto prev_elb_params = slot.sparams.elb_params;
-
-        const auto& expiring_logit_bias = data.find("expiring_logit_bias");
-        if (expiring_logit_bias != data.end() && expiring_logit_bias->is_array()) {
-            // has new params from api
-            std::string content;
-            for (const auto& line: data["expiring_logit_bias"]) {
-                if (line.is_string()) {
-                    content += line.get<std::string>() + "\n";
-                }
-            }
-            try {
-                argparse_expiring_logit_bias(content, slot.sparams);
-            } catch (const std::invalid_argument& e) {
-                std::cerr << e.what() << '\n';
-            } catch (const std::out_of_range& e) {
-                std::cerr << e.what() << '\n';
-            }
-        }
-
         const auto& elb_params = slot.sparams.elb_params;
         if (elb_params.empty()) {
             slot.ctx_sampling->elb_states.clear();
             break;
         }
 
-        if (!slot.prev_elb_states.empty() && (elb_params == prev_elb_params)) {
-            // reset and reuse previous states
+        if (!slot.prev_elb_states.empty() && (elb_params == default_sparams.elb_params)) {
+            // no params from the request: reset and reuse the previous states
             slot.ctx_sampling->elb_states = slot.prev_elb_states;
             for (auto& elb_state: slot.ctx_sampling->elb_states) {
                 elb_state.countup = 0;
